@@ -1,0 +1,13 @@
+[package]
+name = "senpai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "senpai"
+path = "src/main.rs"
+
+[dependencies]
+senpai-core = { path = "../../crates/senpai-core" }
+senpai-pdf-poppler = { path = "../../crates/senpai-pdf-poppler" }
