@@ -1,0 +1,15 @@
+[package]
+name = "senpai-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "senpai-ui"
+path = "src/main.rs"
+
+[dependencies]
+senpai-core = { path = "../../crates/senpai-core" }
+senpai-pdf-poppler = { path = "../../crates/senpai-pdf-poppler" }
+
+eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = "0.29"

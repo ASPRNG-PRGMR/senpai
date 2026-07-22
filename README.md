@@ -80,21 +80,27 @@ senpai/
 │           └── lib.rs
 │
 └── apps/
-    └── cli/                    # senpai-cli — the composition root that
-        └── src/                # picks poppler as the concrete PdfEngine
-            └── main.rs         # backend; current dev/benchmark entry point
+    ├── cli/                    # senpai-cli — the composition root that
+    │   └── src/                # picks poppler as the concrete PdfEngine
+    │       └── main.rs         # backend; dev/benchmark entry point
+    │
+    └── ui/                     # senpai-ui — the windowed reader (eframe/
+        └── src/                # egui + wgpu). No side panel, no top bar —
+            └── main.rs         # just the page and floating, hideable pills
 ```
 
-A UI crate (`apps/ui` or similar) and future backends (e.g. `crates/engine-native`) slot into this same structure without touching existing crates.
+Future backends (e.g. `crates/engine-native`) slot into this same structure without touching existing crates.
 
 ## Status
 
-SENPAI is under active early development. The workspace skeleton is up and the poppler-backed `PdfEngine` is working end to end: opening a document, reading metadata, and reading page geometry all run through the CLI today. Actual pixel rendering, scrolling/zoom UI, search, annotations, and plugins are next.
+SENPAI is under active early development. What's working right now:
+
+- **Opening documents**: memory-mapped file loading, poppler-backed parsing, metadata and page geometry — all running through the `PdfEngine` trait, verified against real PDFs.
+- **Rendering**: pages render correctly through poppler and have been checked pixel-for-pixel against Evince's output.
+- **A minimal windowed reader** (`senpai-ui`): opens a PDF into a native window with no side panel and no top bar — just the current page, centered and scaled to fit. Controls live in small floating "pill" toolbars (page navigation, zoom) that can be hidden entirely with a keypress, leaving nothing but the document on screen. Keyboard navigation (arrow keys, `+`/`-`, space) works alongside the on-screen controls.
+
+Not yet built: scrolling (currently single-page-at-a-time), background/off-main-thread rendering, search, annotations, session state, and the plugin system.
 
 ## Philosophy on AI
 
 AI is an enhancement, not the product. Every AI capability is implemented as an optional plugin on top of the core reader — the core itself never depends on AI to function.
-
-## Contributing
-
-SENPAI is open source and intended to be a serious, long-lived project rather than a demo. Contributions that align with the performance-first, minimal-dependency philosophy above are welcome. (Contribution guide coming soon.)

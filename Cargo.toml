@@ -5,6 +5,7 @@ members = [
     "crates/senpai-pdf-poppler",
     "crates/senpai-render",
     "apps/senpai-cli",
+    "apps/senpai-ui"
 ]
 
 [workspace.package]
