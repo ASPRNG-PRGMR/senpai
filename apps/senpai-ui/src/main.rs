@@ -1,15 +1,10 @@
-//! senpai-ui — the first real windowed prototype.
+//! senpai-ui — windowed reader, v2 UI.
 //!
-//! Deliberately minimal: no side panel, no top/menu bar. The page fills
-//! the window; the only chrome is a small set of floating "pill" controls
-//! that can be hidden entirely (press `H`) so the document is the only
-//! thing on screen when you want it to be.
-//!
-//! This is a UI-shape milestone, not a performance one — rendering still
-//! happens synchronously on open/page-change (see the ~111ms/page number
-//! from the CLI benchmarks). Moving render calls off the main thread is
-//! tracked separately and will slot in underneath this same UI without
-//! changing how it looks.
+//! Exactly one floating pill: a wide top bar (Files / Tools / Modes /
+//! Options) that stays hidden unless the user hovers the top of the
+//! window or triggers a menu via an Alt+<letter> shortcut. Auto-hide can
+//! be disabled entirely from the Options menu. No other floating chrome
+//! exists anywhere in this app.
 
 use eframe::egui;
 use senpai_core::engine::{PdfEngine, PdfEngineOpen};
@@ -33,8 +28,6 @@ fn main() -> eframe::Result<()> {
         eprintln!("failed to parse {path}: {e}");
         std::process::exit(1);
     });
-    // `engine` owns its own copy of the document bytes internally, so
-    // `file`'s mmap doesn't need to outlive this point.
     drop(file);
 
     let page_count = engine.metadata().page_count;
@@ -58,6 +51,14 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Menu {
+    Files,
+    Tools,
+    Modes,
+    Options,
+}
+
 struct SenpaiApp {
     engine: PopplerEngine,
     page_count: usize,
@@ -65,10 +66,18 @@ struct SenpaiApp {
     scale: f64,
 
     texture: Option<egui::TextureHandle>,
-    texture_for: Option<(usize, u64)>, // (page index, scale bits) the texture matches
+    texture_for: Option<(usize, u64)>,
 
-    ui_visible: bool,
+    dark_mode: bool,
+    auto_hide_enabled: bool,
+    open_menu: Option<Menu>,
 }
+
+/// Height, in logical points, of the invisible strip at the top of the
+/// window that reveals the bar on hover. Deliberately taller than the
+/// bar's own drawn height so the cursor doesn't need to land pixel-
+/// perfectly on the (currently invisible) pill to trigger it.
+const HOVER_ZONE_HEIGHT: f32 = 40.0;
 
 impl SenpaiApp {
     fn new(engine: PopplerEngine, page_count: usize) -> Self {
@@ -79,20 +88,17 @@ impl SenpaiApp {
             scale: 1.5,
             texture: None,
             texture_for: None,
-            ui_visible: true,
+            dark_mode: true,
+            auto_hide_enabled: true,
+            open_menu: None,
         }
     }
 
-    /// Re-renders the current page into a GPU texture only if the page
-    /// index or scale actually changed since the last frame — this is
-    /// the one guard standing between "fine" and "re-rendering at
-    /// ~110ms every single frame," which would make the UI unusable.
     fn ensure_texture(&mut self, ctx: &egui::Context) {
         let want = (self.current_page, self.scale.to_bits());
         if self.texture_for == Some(want) {
             return;
         }
-
         match self
             .engine
             .render_page(PageHandle(self.current_page), self.scale)
@@ -106,9 +112,7 @@ impl SenpaiApp {
                 self.texture = Some(handle);
                 self.texture_for = Some(want);
             }
-            Err(e) => {
-                eprintln!("render failed for page {}: {e}", self.current_page);
-            }
+            Err(e) => eprintln!("render failed for page {}: {e}", self.current_page),
         }
     }
 
@@ -117,29 +121,35 @@ impl SenpaiApp {
             self.current_page += 1;
         }
     }
-
     fn prev_page(&mut self) {
         self.current_page = self.current_page.saturating_sub(1);
     }
-
     fn zoom_in(&mut self) {
         self.scale = (self.scale * 1.2).min(6.0);
     }
-
     fn zoom_out(&mut self) {
         self.scale = (self.scale / 1.2).max(0.2);
+    }
+
+    fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
+        self.dark_mode = dark;
+        ctx.set_visuals(if dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
     }
 }
 
 impl eframe::App for SenpaiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (want_next, want_prev, want_zoom_in, want_zoom_out, want_toggle_ui) = ctx.input(|i| {
+        // --- page navigation / zoom keyboard shortcuts (unrelated to the bar) ---
+        let (want_next, want_prev, want_zoom_in, want_zoom_out) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
                 i.key_pressed(egui::Key::Minus),
-                i.key_pressed(egui::Key::H),
             )
         });
         if want_next {
@@ -154,16 +164,53 @@ impl eframe::App for SenpaiApp {
         if want_zoom_out {
             self.zoom_out();
         }
-        if want_toggle_ui {
-            self.ui_visible = !self.ui_visible;
+
+        // --- bar-opening shortcuts: Alt+F / Alt+T / Alt+M / Alt+O ---
+        let (alt_f, alt_t, alt_m, alt_o, escape) = ctx.input(|i| {
+            (
+                i.modifiers.alt && i.key_pressed(egui::Key::F),
+                i.modifiers.alt && i.key_pressed(egui::Key::T),
+                i.modifiers.alt && i.key_pressed(egui::Key::M),
+                i.modifiers.alt && i.key_pressed(egui::Key::O),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if alt_f {
+            self.open_menu = Some(Menu::Files);
         }
+        if alt_t {
+            self.open_menu = Some(Menu::Tools);
+        }
+        if alt_m {
+            self.open_menu = Some(Menu::Modes);
+        }
+        if alt_o {
+            self.open_menu = Some(Menu::Options);
+        }
+        if escape {
+            self.open_menu = None;
+        }
+
+        // --- hover-to-reveal detection ---
+        let hovering_top = ctx.input(|i| {
+            i.pointer
+                .hover_pos()
+                .map(|p| p.y <= HOVER_ZONE_HEIGHT)
+                .unwrap_or(false)
+        });
+
+        let bar_visible = !self.auto_hide_enabled || hovering_top || self.open_menu.is_some();
 
         self.ensure_texture(ctx);
 
-        // --- the page itself: one CentralPanel, zero frame/border, no
-        // side or top panels anywhere in this app ---
+        let bg = if self.dark_mode {
+            egui::Color32::from_gray(30)
+        } else {
+            egui::Color32::from_gray(235)
+        };
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
+            .frame(egui::Frame::none().fill(bg))
             .show(ctx, |ui| {
                 if let Some(tex) = &self.texture {
                     let avail = ui.available_size();
@@ -176,79 +223,136 @@ impl eframe::App for SenpaiApp {
                 }
             });
 
-        if self.ui_visible {
-            self.show_pill_toolbar(ctx);
+        if bar_visible {
+            self.show_top_bar(ctx);
         }
-        self.show_visibility_toggle(ctx);
     }
 }
 
 impl SenpaiApp {
-    /// The main floating pill: page nav + zoom, anchored to the bottom
-    /// center of the window, rounded, semi-transparent, no title bar —
-    /// deliberately not a docked panel of any kind.
-    fn show_pill_toolbar(&mut self, ctx: &egui::Context) {
-        let pill_frame = egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(210))
-            .rounding(egui::Rounding::same(20.0))
-            .inner_margin(egui::Margin::symmetric(16.0, 10.0));
+    /// The one and only floating pill: a wide bar across the top of the
+    /// window, Files / Tools / Modes / Options. No other pill exists in
+    /// this app.
+    fn show_top_bar(&mut self, ctx: &egui::Context) {
+        let bar_frame = egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(230))
+            .rounding(egui::Rounding::same(18.0))
+            .inner_margin(egui::Margin::symmetric(20.0, 10.0));
 
-        egui::Area::new(egui::Id::new("pill_toolbar"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
+        let screen_width = ctx.screen_rect().width();
+        let bar_width = (screen_width - 80.0).min(900.0).max(280.0);
+
+        egui::Area::new(egui::Id::new("top_bar"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
             .show(ctx, |ui| {
-                pill_frame.show(ui, |ui| {
+                ui.set_width(bar_width);
+                bar_frame.show(ui, |ui| {
+                    ui.set_width(bar_width - 40.0);
                     ui.horizontal(|ui| {
-                        if ui.button("◀").clicked() {
-                            self.prev_page();
-                        }
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} / {}",
-                                self.current_page + 1,
-                                self.page_count
-                            ))
-                            .color(egui::Color32::WHITE),
-                        );
-                        if ui.button("▶").clicked() {
-                            self.next_page();
-                        }
-                        ui.separator();
-                        if ui.button("−").clicked() {
-                            self.zoom_out();
-                        }
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", self.scale / 1.5 * 100.0))
-                                .color(egui::Color32::WHITE),
-                        );
-                        if ui.button("+").clicked() {
-                            self.zoom_in();
-                        }
+                        self.menu_button(ui, "Files", Menu::Files);
+                        self.menu_button(ui, "Tools", Menu::Tools);
+                        self.menu_button(ui, "Modes", Menu::Modes);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.menu_button(ui, "Options", Menu::Options);
+                        });
                     });
                 });
             });
+
+        if let Some(menu) = self.open_menu {
+            self.show_menu_dropdown(ctx, menu, bar_width);
+        }
     }
 
-    /// A tiny, always-present pill in the corner that toggles the main
-    /// toolbar — this is the "hideable" part of the brief. Same visual
-    /// language as the main pill so it doesn't read as a stray button.
-    fn show_visibility_toggle(&mut self, ctx: &egui::Context) {
-        let pill_frame = egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(180))
-            .rounding(egui::Rounding::same(14.0))
-            .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+    fn menu_button(&mut self, ui: &mut egui::Ui, label: &str, kind: Menu) {
+        let selected = self.open_menu == Some(kind);
+        let text = egui::RichText::new(label).color(egui::Color32::WHITE);
+        let button = egui::Button::new(text).fill(if selected {
+            egui::Color32::from_white_alpha(30)
+        } else {
+            egui::Color32::TRANSPARENT
+        });
+        if ui.add(button).clicked() {
+            self.open_menu = if selected { None } else { Some(kind) };
+        }
+    }
 
-        egui::Area::new(egui::Id::new("visibility_toggle"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+    fn show_menu_dropdown(&mut self, ctx: &egui::Context, menu: Menu, bar_width: f32) {
+        let frame = egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(235))
+            .rounding(egui::Rounding::same(14.0))
+            .inner_margin(egui::Margin::symmetric(16.0, 12.0));
+
+        egui::Area::new(egui::Id::new("menu_dropdown"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 68.0))
             .show(ctx, |ui| {
-                pill_frame.show(ui, |ui| {
-                    let label = if self.ui_visible { "hide (H)" } else { "show (H)" };
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new(label).color(egui::Color32::WHITE),
-                        ))
-                        .clicked()
-                    {
-                        self.ui_visible = !self.ui_visible;
+                ui.set_width(bar_width.min(320.0));
+                frame.show(ui, |ui| match menu {
+                    Menu::Files => {
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("Open...").color(egui::Color32::WHITE),
+                            ))
+                            .clicked()
+                        {
+                            // TODO: wire to a real file picker (e.g. the
+                            // `rfd` crate) once this shape is confirmed.
+                            eprintln!("Open... clicked (file picker not wired yet)");
+                            self.open_menu = None;
+                        }
+                    }
+                    Menu::Tools => {
+                        ui.label(
+                            egui::RichText::new("Annotation tools (coming soon)")
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                egui::RichText::new("Highlight").color(egui::Color32::GRAY),
+                            ),
+                        );
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                egui::RichText::new("Note").color(egui::Color32::GRAY),
+                            ),
+                        );
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                egui::RichText::new("Draw").color(egui::Color32::GRAY),
+                            ),
+                        );
+                    }
+                    Menu::Modes => {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("Light").color(egui::Color32::WHITE),
+                                ))
+                                .clicked()
+                            {
+                                self.set_dark(ctx, false);
+                            }
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("Night").color(egui::Color32::WHITE),
+                                ))
+                                .clicked()
+                            {
+                                self.set_dark(ctx, true);
+                            }
+                        });
+                    }
+                    Menu::Options => {
+                        let mut auto_hide = self.auto_hide_enabled;
+                        if ui
+                            .checkbox(&mut auto_hide, "Enable auto-hide")
+                            .changed()
+                        {
+                            self.auto_hide_enabled = auto_hide;
+                        }
                     }
                 });
             });

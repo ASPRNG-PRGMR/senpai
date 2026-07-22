@@ -6,7 +6,7 @@ members = [
     "crates/senpai-render",
     "apps/senpai-cli",
     "apps/senpai-ui"
-]
+, "apps/win-test"]
 
 [workspace.package]
 version = "0.1.0"

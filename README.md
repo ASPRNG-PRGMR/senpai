@@ -85,8 +85,9 @@ senpai/
     │       └── main.rs         # backend; dev/benchmark entry point
     │
     └── ui/                     # senpai-ui — the windowed reader (eframe/
-        └── src/                # egui + wgpu). No side panel, no top bar —
-            └── main.rs         # just the page and floating, hideable pills
+        └── src/                # egui + wgpu). No side panel, no menu bar —
+            └── main.rs         # one floating top bar, hidden until hovered
+                                 # or opened via Alt+F/T/M/O
 ```
 
 Future backends (e.g. `crates/engine-native`) slot into this same structure without touching existing crates.
@@ -97,9 +98,9 @@ SENPAI is under active early development. What's working right now:
 
 - **Opening documents**: memory-mapped file loading, poppler-backed parsing, metadata and page geometry — all running through the `PdfEngine` trait, verified against real PDFs.
 - **Rendering**: pages render correctly through poppler and have been checked pixel-for-pixel against Evince's output.
-- **A minimal windowed reader** (`senpai-ui`): opens a PDF into a native window with no side panel and no top bar — just the current page, centered and scaled to fit. Controls live in small floating "pill" toolbars (page navigation, zoom) that can be hidden entirely with a keypress, leaving nothing but the document on screen. Keyboard navigation (arrow keys, `+`/`-`, space) works alongside the on-screen controls.
+- **A minimal windowed reader** (`senpai-ui`): opens a PDF into a native window with no side panel and no dedicated menu bar — just the current page, centered and scaled to fit. The only chrome is a single floating top bar (Files / Tools / Modes / Options) that stays hidden by default and reveals itself when you hover the top of the window or trigger a menu with `Alt+F` / `Alt+T` / `Alt+M` / `Alt+O`; auto-hide can be turned off entirely from Options. Modes includes a working Light/Night toggle. Keyboard page navigation (arrow keys, `+`/`-`, space) works regardless of whether the bar is visible.
 
-Not yet built: scrolling (currently single-page-at-a-time), background/off-main-thread rendering, search, annotations, session state, and the plugin system.
+Not yet built: scrolling (currently single-page-at-a-time), background/off-main-thread rendering, file picker (Files → Open is stubbed), annotation tools (present in the UI but disabled), search, session state, and the plugin system.
 
 ## Philosophy on AI
 
