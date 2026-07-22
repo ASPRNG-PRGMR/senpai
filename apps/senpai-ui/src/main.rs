@@ -1,17 +1,32 @@
-//! senpai-ui — windowed reader, v2 UI.
+//! senpai-ui — windowed reader, v3: background rendering.
 //!
-//! Exactly one floating pill: a wide top bar (Files / Tools / Modes /
-//! Options) that stays hidden unless the user hovers the top of the
-//! window or triggers a menu via an Alt+<letter> shortcut. Auto-hide can
-//! be disabled entirely from the Options menu. No other floating chrome
-//! exists anywhere in this app.
+//! Rendering now happens on a dedicated background thread instead of
+//! blocking the UI thread. The two threads coordinate through a
+//! "latest wins" shared slot (Mutex + Condvar) for requests -- if the
+//! user flips pages faster than rendering can keep up, only the most
+//! recently requested page/scale ever actually gets rendered, nothing
+//! queues up and falls behind -- plus an mpsc channel carrying results
+//! back, tagged with a generation number so stale/superseded results
+//! are silently discarded rather than flashing an old page onto screen.
+//!
+//! Verified with a standalone test (real PDF, real background thread)
+//! before wiring into the UI: see commit history for that check.
+//!
+//! Important invariant: after startup, the UI/main thread never touches
+//! `engine` directly again -- only the background thread calls
+//! `render_page`. poppler-cpp's thread-safety story for a single shared
+//! `document` is not well-documented, so rather than relying on
+//! internal locking we simply never access it from two threads at once.
 
 use eframe::egui;
 use senpai_core::engine::{PdfEngine, PdfEngineOpen};
 use senpai_core::file_loader::LoadedFile;
-use senpai_core::model::PageHandle;
+use senpai_core::model::{PageHandle, RenderedPage};
 use senpai_pdf_poppler::PopplerEngine;
 use std::env;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 fn main() -> eframe::Result<()> {
     let mut args = env::args().skip(1);
@@ -47,7 +62,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "senpai",
         options,
-        Box::new(move |_cc| Ok(Box::new(SenpaiApp::new(engine, page_count)))),
+        Box::new(move |cc| Ok(Box::new(SenpaiApp::new(engine, page_count, cc)))),
     )
 }
 
@@ -59,60 +74,169 @@ enum Menu {
     Options,
 }
 
+/// A render request in flight to the background thread. Writing a new
+/// one into the shared slot overwrites whatever was there -- "latest
+/// wins," no queue, no backlog.
+struct PendingRequest {
+    page: usize,
+    scale: f64,
+    generation: u64,
+}
+
+/// What comes back from the background thread. Tagged with the same
+/// generation so the UI thread can tell a fresh result from a stale one
+/// that got superseded while it was still rendering.
+struct RenderResult {
+    generation: u64,
+    page: usize,
+    scale: f64,
+    outcome: Result<RenderedPage, String>,
+}
+
+type SharedRequest = Arc<(Mutex<Option<PendingRequest>>, Condvar)>;
+
+fn spawn_render_worker(
+    engine: Arc<PopplerEngine>,
+    shared: SharedRequest,
+    result_tx: Sender<RenderResult>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || loop {
+        let request = {
+            let (lock, cvar) = &*shared;
+            let mut guard = lock.lock().unwrap();
+            while guard.is_none() {
+                guard = cvar.wait(guard).unwrap();
+            }
+            guard.take().unwrap()
+        };
+
+        let outcome = engine
+            .render_page(PageHandle(request.page), request.scale)
+            .map_err(|e| e.to_string());
+
+        let _ = result_tx.send(RenderResult {
+            generation: request.generation,
+            page: request.page,
+            scale: request.scale,
+            outcome,
+        });
+        // Wake the UI thread up so it processes the result promptly
+        // instead of waiting for the next input event.
+        ctx.request_repaint();
+    });
+}
+
 struct SenpaiApp {
-    engine: PopplerEngine,
     page_count: usize,
     current_page: usize,
     scale: f64,
 
+    shared_request: SharedRequest,
+    result_rx: Receiver<RenderResult>,
+    next_generation: u64,
+    /// (page, scale-bits, generation) of the most recent request we sent
+    /// -- lets us avoid re-sending an identical request every frame
+    /// while one is already in flight.
+    requested: Option<(usize, u64, u64)>,
+
     texture: Option<egui::TextureHandle>,
     texture_for: Option<(usize, u64)>,
+    render_pending: bool,
 
     dark_mode: bool,
     auto_hide_enabled: bool,
     open_menu: Option<Menu>,
 }
 
-/// Height, in logical points, of the invisible strip at the top of the
-/// window that reveals the bar on hover. Deliberately taller than the
-/// bar's own drawn height so the cursor doesn't need to land pixel-
-/// perfectly on the (currently invisible) pill to trigger it.
 const HOVER_ZONE_HEIGHT: f32 = 40.0;
 
 impl SenpaiApp {
-    fn new(engine: PopplerEngine, page_count: usize) -> Self {
+    fn new(engine: PopplerEngine, page_count: usize, cc: &eframe::CreationContext<'_>) -> Self {
+        let engine = Arc::new(engine);
+        let shared_request: SharedRequest = Arc::new((Mutex::new(None), Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+
+        spawn_render_worker(engine, shared_request.clone(), tx, cc.egui_ctx.clone());
+
         Self {
-            engine,
             page_count,
             current_page: 0,
             scale: 1.5,
+            shared_request,
+            result_rx: rx,
+            next_generation: 0,
+            requested: None,
             texture: None,
             texture_for: None,
+            render_pending: false,
             dark_mode: true,
             auto_hide_enabled: true,
             open_menu: None,
         }
     }
 
-    fn ensure_texture(&mut self, ctx: &egui::Context) {
+    /// Sends a new render request if the desired (page, scale) isn't
+    /// already the current texture or already in flight. Never blocks.
+    fn request_render_if_needed(&mut self) {
         let want = (self.current_page, self.scale.to_bits());
-        if self.texture_for == Some(want) {
+        let already_current = self.texture_for == Some(want);
+        let already_requested = self
+            .requested
+            .map(|(p, s, _)| (p, s) == want)
+            .unwrap_or(false);
+
+        if already_current || already_requested {
             return;
         }
-        match self
-            .engine
-            .render_page(PageHandle(self.current_page), self.scale)
+
+        self.next_generation += 1;
+        let generation = self.next_generation;
+
         {
-            Ok(rendered) => {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [rendered.width_px as usize, rendered.height_px as usize],
-                    &rendered.pixels,
-                );
-                let handle = ctx.load_texture("page", image, egui::TextureOptions::LINEAR);
-                self.texture = Some(handle);
-                self.texture_for = Some(want);
+            let (lock, cvar) = &*self.shared_request;
+            let mut guard = lock.lock().unwrap();
+            *guard = Some(PendingRequest {
+                page: want.0,
+                scale: self.scale,
+                generation,
+            });
+            cvar.notify_one();
+        }
+
+        self.requested = Some((want.0, want.1, generation));
+        self.render_pending = true;
+    }
+
+    /// Drains any results waiting on the channel. Discards anything that
+    /// isn't the latest generation we asked for -- that's a render that
+    /// got superseded by a faster page-flip before it finished.
+    fn drain_results(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.result_rx.try_recv() {
+            let is_latest = self
+                .requested
+                .map(|(_, _, gen)| gen == result.generation)
+                .unwrap_or(false);
+            if !is_latest {
+                continue; // stale, discard
             }
-            Err(e) => eprintln!("render failed for page {}: {e}", self.current_page),
+
+            self.render_pending = false;
+            match result.outcome {
+                Ok(rendered) => {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [rendered.width_px as usize, rendered.height_px as usize],
+                        &rendered.pixels,
+                    );
+                    let handle =
+                        ctx.load_texture("page", image, egui::TextureOptions::LINEAR);
+                    self.texture = Some(handle);
+                    self.texture_for = Some((result.page, result.scale.to_bits()));
+                }
+                Err(e) => {
+                    eprintln!("render failed for page {}: {e}", result.page);
+                }
+            }
         }
     }
 
@@ -143,7 +267,6 @@ impl SenpaiApp {
 
 impl eframe::App for SenpaiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- page navigation / zoom keyboard shortcuts (unrelated to the bar) ---
         let (want_next, want_prev, want_zoom_in, want_zoom_out) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Space),
@@ -165,7 +288,6 @@ impl eframe::App for SenpaiApp {
             self.zoom_out();
         }
 
-        // --- bar-opening shortcuts: Alt+F / Alt+T / Alt+M / Alt+O ---
         let (alt_f, alt_t, alt_m, alt_o, escape) = ctx.input(|i| {
             (
                 i.modifiers.alt && i.key_pressed(egui::Key::F),
@@ -191,17 +313,16 @@ impl eframe::App for SenpaiApp {
             self.open_menu = None;
         }
 
-        // --- hover-to-reveal detection ---
         let hovering_top = ctx.input(|i| {
             i.pointer
                 .hover_pos()
                 .map(|p| p.y <= HOVER_ZONE_HEIGHT)
                 .unwrap_or(false)
         });
-
         let bar_visible = !self.auto_hide_enabled || hovering_top || self.open_menu.is_some();
 
-        self.ensure_texture(ctx);
+        self.drain_results(ctx);
+        self.request_render_if_needed();
 
         let bg = if self.dark_mode {
             egui::Color32::from_gray(30)
@@ -221,6 +342,23 @@ impl eframe::App for SenpaiApp {
                         ui.image((tex.id(), draw_size));
                     });
                 }
+
+                // Subtle, plain-text-only indicator -- deliberately not a
+                // pill/frame, since the only floating pill in this app is
+                // the top bar.
+                if self.render_pending {
+                    ui.put(
+                        egui::Rect::from_min_size(
+                            egui::pos2(12.0, ui.clip_rect().height() - 28.0),
+                            egui::vec2(120.0, 20.0),
+                        ),
+                        egui::Label::new(
+                            egui::RichText::new("rendering…")
+                                .color(egui::Color32::from_gray(160))
+                                .small(),
+                        ),
+                    );
+                }
             });
 
         if bar_visible {
@@ -230,9 +368,6 @@ impl eframe::App for SenpaiApp {
 }
 
 impl SenpaiApp {
-    /// The one and only floating pill: a wide bar across the top of the
-    /// window, Files / Tools / Modes / Options. No other pill exists in
-    /// this app.
     fn show_top_bar(&mut self, ctx: &egui::Context) {
         let bar_frame = egui::Frame::none()
             .fill(egui::Color32::from_black_alpha(230))
@@ -295,8 +430,6 @@ impl SenpaiApp {
                             ))
                             .clicked()
                         {
-                            // TODO: wire to a real file picker (e.g. the
-                            // `rfd` crate) once this shape is confirmed.
                             eprintln!("Open... clicked (file picker not wired yet)");
                             self.open_menu = None;
                         }
@@ -314,15 +447,11 @@ impl SenpaiApp {
                         );
                         ui.add_enabled(
                             false,
-                            egui::Button::new(
-                                egui::RichText::new("Note").color(egui::Color32::GRAY),
-                            ),
+                            egui::Button::new(egui::RichText::new("Note").color(egui::Color32::GRAY)),
                         );
                         ui.add_enabled(
                             false,
-                            egui::Button::new(
-                                egui::RichText::new("Draw").color(egui::Color32::GRAY),
-                            ),
+                            egui::Button::new(egui::RichText::new("Draw").color(egui::Color32::GRAY)),
                         );
                     }
                     Menu::Modes => {
@@ -347,10 +476,7 @@ impl SenpaiApp {
                     }
                     Menu::Options => {
                         let mut auto_hide = self.auto_hide_enabled;
-                        if ui
-                            .checkbox(&mut auto_hide, "Enable auto-hide")
-                            .changed()
-                        {
+                        if ui.checkbox(&mut auto_hide, "Enable auto-hide").changed() {
                             self.auto_hide_enabled = auto_hide;
                         }
                     }

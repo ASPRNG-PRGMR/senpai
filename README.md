@@ -99,8 +99,11 @@ SENPAI is under active early development. What's working right now:
 - **Opening documents**: memory-mapped file loading, poppler-backed parsing, metadata and page geometry — all running through the `PdfEngine` trait, verified against real PDFs.
 - **Rendering**: pages render correctly through poppler and have been checked pixel-for-pixel against Evince's output.
 - **A minimal windowed reader** (`senpai-ui`): opens a PDF into a native window with no side panel and no dedicated menu bar — just the current page, centered and scaled to fit. The only chrome is a single floating top bar (Files / Tools / Modes / Options) that stays hidden by default and reveals itself when you hover the top of the window or trigger a menu with `Alt+F` / `Alt+T` / `Alt+M` / `Alt+O`; auto-hide can be turned off entirely from Options. Modes includes a working Light/Night toggle. Keyboard page navigation (arrow keys, `+`/`-`, space) works regardless of whether the bar is visible.
+- **Background rendering**: page rendering runs on a dedicated background thread instead of blocking the UI — page turns and zoom no longer freeze the window while poppler works. Rapid page-flipping doesn't queue up or flash through intermediate pages: only the most recently requested page/scale ever gets rendered, and any in-flight render that gets superseded is discarded when it completes rather than shown. A plain-text "rendering…" indicator (not a pill — the only pill in the app is the top bar) appears while a render is in flight.
 
-Not yet built: scrolling (currently single-page-at-a-time), background/off-main-thread rendering, file picker (Files → Open is stubbed), annotation tools (present in the UI but disabled), search, session state, and the plugin system.
+Not yet built: scrolling (currently single-page-at-a-time), file picker (Files → Open is stubbed), annotation tools (present in the UI but disabled), search, session state, and the plugin system.
+
+**Platform support**: developed on Linux. The windowing/rendering stack (`winit` + `wgpu` + `egui`) has been verified to build and run on Windows too — cross-compiled via `mingw-w64` and tested under Wine — confirming the UI architecture itself is portable. PDF rendering is not yet part of that verification: `poppler-cpp` (the current PDF backend) isn't cross-built for Windows yet, so the full reader with real documents hasn't run there. A throwaway `apps/win-test` crate (no poppler dependency) is what's used to validate the windowing stack on Windows; it's not part of the shipped app.
 
 ## Philosophy on AI
 
