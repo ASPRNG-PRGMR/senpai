@@ -103,7 +103,29 @@ SENPAI is under active early development. What's working right now:
 
 Not yet built: scrolling (currently single-page-at-a-time), file picker (Files → Open is stubbed), annotation tools (present in the UI but disabled), search, session state, and the plugin system.
 
-**Platform support**: developed on Linux. The windowing/rendering stack (`winit` + `wgpu` + `egui`) has been verified to build and run on Windows too — cross-compiled via `mingw-w64` and tested under Wine — confirming the UI architecture itself is portable. PDF rendering is not yet part of that verification: `poppler-cpp` (the current PDF backend) isn't cross-built for Windows yet, so the full reader with real documents hasn't run there. A throwaway `apps/win-test` crate (no poppler dependency) is what's used to validate the windowing stack on Windows; it's not part of the shipped app.
+**Platform support**: developed on Linux. The full reader — including PDF rendering, not just the windowing stack — now cross-compiles for Windows via `mingw-w64` and runs correctly under Wine with real documents. `poppler-cpp` and its full dependency chain (cairo/freetype/harfbuzz/glib/image codecs, etc.) are cross-built from prebuilt MSYS2 mingw64 packages, resolved and fetched by a script rather than assembled by hand, so this is reproducible rather than a one-off. The confirmed minimal set of runtime DLLs that must ship alongside `senpai-ui.exe` (derived by testing — removing a DLL and confirming the app fails without it — not just by guessing):
+
+```
+libbrotlicommon.dll  libglib-2.0-0.dll  liblcms2-2.dll               libopenjp2-7.dll      libsharpyuv-0.dll    libzstd.dll
+libbrotlidec.dll     libgraphite2.dll   libLerc.dll                  libpcre2-8-0.dll      libssh2-1.dll        nss3.dll
+libbz2-1.dll         libharfbuzz-0.dll  liblzma-5.dll                libplc4.dll           libssl-3-x64.dll     nssutil3.dll
+libcrypto-3-x64.dll  libiconv-2.dll     libnghttp2-14.dll            libplds4.dll          libstdc++-6.dll      smime3.dll
+libcurl-4.dll        libidn2-0.dll      libnghttp3-9.dll             libpng16-16.dll       libtiff-6.dll        zlib1.dll
+libdeflate.dll       libintl-8.dll      libngtcp2-16.dll             libpoppler-162.dll    libunistring-5.dll
+libfreetype-6.dll    libjbig-0.dll      libngtcp2_crypto_ossl-0.dll  libpoppler-cpp-3.dll  libwebp-7.dll
+libgcc_s_seh-1.dll   libjpeg-8.dll      libnspr4.dll                 libpsl-5.dll          libwinpthread-1.dll
+```
+
+Notably absent: `libcairo-2.dll` and `libfontconfig-1.dll` weren't touched during this test, suggesting poppler-cpp's rendering path here doesn't route through cairo and didn't need system font fallback — plausible since the test document likely has embedded fonts. This list is derived from a single test document; a PDF relying on non-embedded fonts or a different poppler render path could pull in libraries not covered here, so it shouldn't be treated as exhaustive until verified against a more varied set of PDFs.
+
+Remaining before this is a real release artifact: verifying in a genuinely clean Wine prefix (or a real clean Windows machine) rather than one that's accumulated state, and testing against more varied PDFs to confirm the DLL list holds.
+
+## Windows Build (cross-compiled from Linux)
+
+1. Install `mingw-w64` and add the Rust target: `rustup target add x86_64-pc-windows-gnu`
+2. Fetch the mingw64 poppler sysroot: `./fetch-mingw64-sysroot.sh` (resolves poppler's full dependency tree from MSYS2's package database and downloads/extracts everything into `mingw64-sysroot/`, gitignored — rerun any time poppler updates rather than maintaining a hand-written dependency list)
+3. Build: `SENPAI_MINGW_SYSROOT=$(pwd)/mingw64-sysroot cargo build -p senpai-ui --target x86_64-pc-windows-gnu`
+4. Bundle: copy `senpai-ui.exe` plus the DLL list above (from `mingw64-sysroot/mingw64/bin/`) into one folder — that folder is the shippable artifact, not the bare exe
 
 ## Philosophy on AI
 

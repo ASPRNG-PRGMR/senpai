@@ -58,8 +58,7 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-
-    eframe::run_native(
+        eframe::run_native(
         "senpai",
         options,
         Box::new(move |cc| Ok(Box::new(SenpaiApp::new(engine, page_count, cc)))),

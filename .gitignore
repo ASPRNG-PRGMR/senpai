@@ -2,3 +2,5 @@ ROADMAP.md
 Cargo.lock
 /target/
 **/target/
+/mingw64-sysroot/
+/win-test/senpai-ui.exe
