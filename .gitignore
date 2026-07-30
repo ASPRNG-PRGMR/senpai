@@ -4,3 +4,4 @@ Cargo.lock
 **/target/
 /mingw64-sysroot/
 /win-test/senpai-ui.exe
+build-run-windows

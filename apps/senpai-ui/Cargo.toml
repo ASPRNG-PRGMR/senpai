@@ -13,3 +13,4 @@ senpai-pdf-poppler = { path = "../../crates/senpai-pdf-poppler" }
 
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = "0.29"
+lru = "0.12"
