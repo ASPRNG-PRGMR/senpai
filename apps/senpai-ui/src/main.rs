@@ -148,15 +148,35 @@ fn spawn_render_worker(
                 // Queue neighbors for opportunistic prefetch -- only if
                 // not already cached, and only ever processed below when
                 // no real request is waiting.
-                if request.page > 0 {
-                    let prev_key = (request.page - 1, request.scale.to_bits());
-                    if !cache.contains(&prev_key) {
-                        prefetch_queue.push_back((request.page - 1, request.scale));
+                //
+                // Depth chosen from measured data: renders average ~78ms
+                // on a 982-page real-world document, consistent across
+                // the whole book (not just a few heavy pages). A user
+                // flipping faster than ~1 page per 78ms will outrun a
+                // depth-1 prefetch and fall back to "latest wins"
+                // skipping. Depth 3 forward gives roughly 3x that margin
+                // before the same thing happens, at negligible extra
+                // memory cost (each cached page ~8MB, well within the
+                // existing 20-entry/~160MB cache budget). Fixed for now;
+                // adapting depth to actual flip speed is a reasonable
+                // later refinement once we know fixed-3 isn't enough.
+                const PREFETCH_DEPTH_FORWARD: usize = 3;
+                const PREFETCH_DEPTH_BACKWARD: usize = 1;
+
+                for back in 1..=PREFETCH_DEPTH_BACKWARD {
+                    if let Some(page) = request.page.checked_sub(back) {
+                        let key = (page, request.scale.to_bits());
+                        if !cache.contains(&key) {
+                            prefetch_queue.push_back((page, request.scale));
+                        }
                     }
                 }
-                let next_key = (request.page + 1, request.scale.to_bits());
-                if !cache.contains(&next_key) {
-                    prefetch_queue.push_back((request.page + 1, request.scale));
+                for fwd in 1..=PREFETCH_DEPTH_FORWARD {
+                    let page = request.page + fwd;
+                    let key = (page, request.scale.to_bits());
+                    if !cache.contains(&key) {
+                        prefetch_queue.push_back((page, request.scale));
+                    }
                 }
 
                 continue;

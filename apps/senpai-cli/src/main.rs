@@ -50,9 +50,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let t_open = t0.elapsed();
 
+    let t_open = t0.elapsed();
     let meta = engine.metadata();
+    
     println!("file:        {}", file.path().display());
     println!("size:        {} bytes", file.len());
     println!("pages:       {}", meta.page_count);
@@ -71,28 +72,46 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: could not read page 1 size: {e}"),
     }
 
-    let t_render_start = Instant::now();
-    let rendered = match engine.render_page(PageHandle(0), scale) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("failed to render page 1: {e}");
-            return ExitCode::FAILURE;
+    let sample_count = meta.page_count.min(20); // sample up to 20 pages, spread across the doc
+    let step = (meta.page_count / sample_count).max(1);
+
+    let mut times = Vec::new();
+    for i in 0..sample_count {
+        let page_idx = i * step;
+        let t = std::time::Instant::now();
+
+        match engine.render_page(PageHandle(page_idx), 2.0) {
+            Ok(r) => {
+                let elapsed = t.elapsed();
+                println!(
+                    "page {page_idx:>4}: {:>5}x{:<5} in {elapsed:?}",
+                    r.width_px,
+                    r.height_px
+                );
+                times.push(elapsed);
+            }
+            Err(e) => eprintln!("page {page_idx} failed: {e}"),
         }
-    };
-    let t_render = t_render_start.elapsed();
-    println!(
-        "render:      {}x{} px at scale {scale} in {t_render:?}",
-        rendered.width_px, rendered.height_px
-    );
-
-    if let Err(e) = write_ppm(&out_path, rendered.width_px, rendered.height_px, &rendered.pixels) {
-        eprintln!("failed to write {out_path}: {e}");
-        return ExitCode::FAILURE;
     }
-    println!("wrote:       {out_path}");
 
+    if !times.is_empty() {
+        let total: std::time::Duration = times.iter().sum();
+        let avg = total / times.len() as u32;
+        let max = times.iter().max().unwrap();
+        let min = times.iter().min().unwrap();
+
+        println!(
+            "\nrender stats over {} pages: min={:?} avg={:?} max={:?}",
+            times.len(),
+            min,
+            avg,
+            max
+        );
+    }
     ExitCode::SUCCESS
 }
+
+    
 
 fn default_output_path(input: &str) -> String {
     let stem = Path::new(input)
