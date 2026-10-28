@@ -185,6 +185,7 @@ pub struct Pill<'a> {
     enabled: bool,
     min_width: f32,
     font_size: f32,
+    align_left: bool,
 }
 
 impl<'a> Pill<'a> {
@@ -195,6 +196,7 @@ impl<'a> Pill<'a> {
             enabled: true,
             min_width: 0.0,
             font_size: 13.0,
+            align_left: false,
         }
     }
 
@@ -226,6 +228,17 @@ impl<'a> Pill<'a> {
 
     pub fn small(mut self) -> Self {
         self.font_size = 11.5;
+        self
+    }
+
+    /// Pins the label to the left edge instead of centring it.
+    ///
+    /// For a column of full-width pills that are a *list* -- recent
+    /// documents, say -- centring leaves every label starting at a
+    /// different x, which is much harder to scan than a flush edge.
+    /// Buttons stay centred; lists get this.
+    pub fn align_left(mut self) -> Self {
+        self.align_left = true;
         self
     }
 
@@ -318,13 +331,15 @@ impl<'a> Pill<'a> {
                 .rect_stroke(rect, rounding, Stroke::new(1.0_f32, white(16)));
         }
         let text_col = if self.enabled { text_col } else { TEXT_FAINT };
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            self.text,
-            font,
-            text_col,
-        );
+        let (anchor, pos) = if self.align_left {
+            (
+                Align2::LEFT_CENTER,
+                pos2(rect.left() + 14.0, rect.center().y),
+            )
+        } else {
+            (Align2::CENTER_CENTER, rect.center())
+        };
+        ui.painter().text(pos, anchor, self.text, font, text_col);
 
         response
     }

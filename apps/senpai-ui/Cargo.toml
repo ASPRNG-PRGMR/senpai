@@ -18,8 +18,9 @@ lru = "0.12"
 # Native file dialog. The XDG portal backend is chosen deliberately over
 # rfd's `gtk3` one: the portal talks D-Bus to whatever dialog the desktop
 # already provides, so there's no GTK build- or link-time dependency to
-# carry (and nothing new for CI to install). On Windows rfd compiles down
-# to the Win32 common dialog, adding no runtime DLLs -- so the confirmed
+# carry (and nothing new for CI to install). On Windows rfd opens the
+# shell's Common Item Dialog (IFileOpenDialog) -- the Explorer picker
+# itself -- through COM already present in the system, so the confirmed
 # Windows DLL bundle is unaffected.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 

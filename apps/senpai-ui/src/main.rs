@@ -38,6 +38,7 @@
 //! Known broken, NOT default (Paged is the startup mode): Continuous
 //! Scroll mode. Deferred to after this release.
 
+mod recent;
 mod theme;
 
 use eframe::egui;
@@ -139,6 +140,38 @@ const HOVER_ZONE_HEIGHT: f32 = 40.0;
 /// for a frame makes an instant action look like a slow one.
 const RENDER_HINT_DELAY: f32 = 0.18;
 const CONTINUOUS_BUFFER_PAGES: usize = 1;
+/// How many recent documents the Files menu lists. The dropdown is a
+/// fixed 330px wide and shares that space with the Open button and the
+/// current document's details; more than this and the menu stops being
+/// something you can read at a glance.
+const RECENT_IN_MENU: usize = 6;
+/// Budget for an entry's label, in characters. The dropdown's pills do
+/// not wrap or truncate on their own -- a long name would simply push
+/// the pill wider than the card.
+const RECENT_NAME_CHARS: usize = 34;
+
+/// Shortens `text` to `max` characters by dropping its middle.
+///
+/// The tail is kept rather than cut because that is where a file name
+/// carries its distinguishing part -- an edition, a chapter number, the
+/// extension -- while the head is often a shared prefix.
+fn elide(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_owned();
+    }
+    // Below this there is no middle left to drop and the result would be
+    // mostly ellipsis; plain truncation is more honest.
+    if max < 6 {
+        return chars[..max].iter().collect();
+    }
+    let tail = max / 3;
+    let head = max - tail - 1;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('\u{2026}');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
 
 enum RenderKind {
     Primary { generation: u64 },
@@ -334,6 +367,9 @@ struct SenpaiApp {
     /// budget rules out.
     pending_open: Option<Receiver<Option<PathBuf>>>,
     open_error: Option<String>,
+    /// Documents opened before, newest first. Also decides where the
+    /// file dialog starts -- see the note at the top of `recent.rs`.
+    recent: recent::Recent,
 
     /// When the current render request started, for `RENDER_HINT_DELAY`.
     render_started: Option<f64>,
@@ -411,6 +447,7 @@ impl SenpaiApp {
             menu_painting: None,
             pending_open: None,
             open_error: None,
+            recent: recent::Recent::load(),
             render_started: None,
             last_shown_page: 0,
             page_pill_until: 0.0,
@@ -437,10 +474,18 @@ impl SenpaiApp {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        // Where the dialog lands matters more here than it would on a
+        // desktop picker with a usable sidebar: start beside the open
+        // document, else beside the last one opened, else somewhere a
+        // document plausibly lives. Anything else drops the user at the
+        // drive root with a lot of clicking ahead of them.
         let start_dir = self
             .doc_path
             .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .filter(|dir| dir.is_dir())
+            .or_else(|| self.recent.start_dir())
+            .or_else(recent::default_start_dir);
         let ctx = ctx.clone();
         thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new()
@@ -475,6 +520,7 @@ impl SenpaiApp {
             Ok((engine, page_count, size)) => {
                 self.install_document(ctx, path, engine, page_count, size);
                 self.open_error = None;
+                self.recent.record(path);
             }
             Err(e) => {
                 self.open_error = Some(format!("{}: {e}", path.display()));
@@ -1276,6 +1322,8 @@ impl SenpaiApp {
                     .size(10.5),
             );
         }
+        self.recent_section(ui, ctx);
+
         if let Some(err) = &self.open_error {
             ui.add_space(4.0);
             ui.label(
@@ -1283,6 +1331,53 @@ impl SenpaiApp {
                     .color(egui::Color32::from_rgb(224, 120, 120))
                     .size(11.0),
             );
+        }
+    }
+
+    /// The point of this list: it is the way back to a document that
+    /// does not involve the file dialog at all.
+    fn recent_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let current = self.doc_path.clone();
+        let entries: Vec<PathBuf> = self
+            .recent
+            .paths()
+            .iter()
+            .filter(|p| current.as_deref() != Some(p.as_path()))
+            .take(RECENT_IN_MENU)
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+
+        ui.add_space(4.0);
+        theme::divider(ui);
+        theme::section_label(ui, "Recent");
+
+        // The click is applied after the loop: opening a document borrows
+        // all of `self`, and the loop is reading `self.recent`.
+        let mut chosen = None;
+        for path in entries {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let hit = Pill::new(&elide(&name, RECENT_NAME_CHARS))
+                .style(PillStyle::Ghost)
+                .small()
+                .align_left()
+                .min_width(ui.available_width())
+                .show(ui)
+                // The full path, because two documents can share a file
+                // name and the elided label can hide which is which.
+                .on_hover_text(path.display().to_string());
+            if hit.clicked() {
+                chosen = Some(path);
+            }
+        }
+        if let Some(path) = chosen {
+            self.open_document(ctx, &path);
+            self.close_menu();
         }
     }
 
@@ -1388,7 +1483,7 @@ impl SenpaiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::should_dismiss_menu;
+    use super::{elide, should_dismiss_menu, RECENT_NAME_CHARS};
     use eframe::egui::{pos2, Rect};
 
     fn bar() -> Rect {
@@ -1456,5 +1551,36 @@ mod tests {
             Rect::NOTHING,
             Rect::NOTHING
         ));
+    }
+
+    #[test]
+    fn elide_leaves_a_short_name_alone() {
+        assert_eq!(elide("notes.pdf", 34), "notes.pdf");
+        // Exactly at the budget is still untouched.
+        assert_eq!(elide("abcdefghij", 10), "abcdefghij");
+    }
+
+    #[test]
+    fn elide_keeps_the_budget_and_both_ends() {
+        let name = "Operating System Concepts, Tenth Edition.pdf";
+        let out = elide(name, RECENT_NAME_CHARS);
+        assert_eq!(out.chars().count(), RECENT_NAME_CHARS);
+        assert!(out.starts_with("Operating"));
+        assert!(out.ends_with(".pdf"));
+        assert!(out.contains('\u{2026}'));
+    }
+
+    /// The label is sliced by character, not by byte: a non-ASCII name
+    /// must not panic on a multi-byte boundary.
+    #[test]
+    fn elide_handles_multibyte_names() {
+        let name = "\u{e9}tude sur les syst\u{e8}mes d'exploitation modernes.pdf";
+        let out = elide(name, 20);
+        assert_eq!(out.chars().count(), 20);
+    }
+
+    #[test]
+    fn elide_falls_back_to_truncation_when_there_is_no_middle() {
+        assert_eq!(elide("abcdefg", 3), "abc");
     }
 }
