@@ -69,8 +69,11 @@ jobs:
       - name: Install cross toolchain
         run: |
           sudo apt-get update
+          # g++ as well as gcc: the poppler shim in senpai-pdf-poppler is
+          # C++, and cxx's link-cplusplus probes for the target g++ by name.
           sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zstd zip
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64 zstd zip
 
       - uses: dtolnay/rust-toolchain@stable
         with:

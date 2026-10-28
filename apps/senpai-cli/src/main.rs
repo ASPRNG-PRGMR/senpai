@@ -486,7 +486,7 @@ fn write_ppm(path: &str, width: u32, height: u32, rgba: &[u8]) -> io::Result<()>
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);
     write!(w, "P6\n{width} {height}\n255\n")?;
-    for chunk in rgba.chunks_exact(4) {
+    for chunk in rgba.as_chunks::<4>().0 {
         w.write_all(&chunk[0..3])?; // R, G, B — skip A
     }
     w.flush()
