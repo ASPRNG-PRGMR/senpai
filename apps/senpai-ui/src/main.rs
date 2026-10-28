@@ -30,8 +30,15 @@
 //!     keeping the invariant that exactly one thread ever touches any
 //!     given poppler document.
 //!
+//! The chrome's look lives in `theme.rs`: capsule surfaces, 120-150ms
+//! state transitions and a segmented switcher, following omen-space's
+//! design vocabulary. Page *content* is deliberately never animated --
+//! see the note at the top of that module.
+//!
 //! Known broken, NOT default (Paged is the startup mode): Continuous
 //! Scroll mode. Deferred to after this release.
+
+mod theme;
 
 use eframe::egui;
 use lru::LruCache;
@@ -46,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use theme::{Pill, PillStyle};
 
 fn main() -> eframe::Result<()> {
     // Force Vulkan explicitly. wgpu's default backend selection on at
@@ -126,6 +134,10 @@ const FALLBACK_PAGE_SIZE: PageSize = PageSize {
     height_pt: 792.0,
 };
 const HOVER_ZONE_HEIGHT: f32 = 40.0;
+/// How long a render must stay pending before the "rendering…" pill is
+/// shown at all. A cache hit resolves in microseconds; flashing a spinner
+/// for a frame makes an instant action look like a slow one.
+const RENDER_HINT_DELAY: f32 = 0.18;
 const CONTINUOUS_BUFFER_PAGES: usize = 1;
 
 enum RenderKind {
@@ -304,6 +316,17 @@ struct SenpaiApp {
     nav_keys: NavKeys,
     rebinding: Option<NavTarget>,
     open_menu: Option<Menu>,
+    /// Where the bar and the open dropdown were painted last frame, used
+    /// to decide whether a click landed on the chrome or outside it.
+    /// Last frame's geometry is accurate enough: neither moves once the
+    /// open animation has settled.
+    bar_rect: egui::Rect,
+    menu_rect: egui::Rect,
+    /// The menu currently being *painted*, which outlives `open_menu` for
+    /// the length of the close animation. Without it the dropdown stops
+    /// being drawn the instant `open_menu` clears, so it faded in and then
+    /// vanished -- the fade-out was computed but never used.
+    menu_painting: Option<Menu>,
 
     /// Result channel for an in-flight file dialog. The dialog itself
     /// runs on its own thread -- blocking the UI thread on it would stall
@@ -311,6 +334,31 @@ struct SenpaiApp {
     /// budget rules out.
     pending_open: Option<Receiver<Option<PathBuf>>>,
     open_error: Option<String>,
+
+    /// When the current render request started, for `RENDER_HINT_DELAY`.
+    render_started: Option<f64>,
+    /// Page the counter pill last showed, so it can re-fade on a change.
+    last_shown_page: usize,
+    page_pill_until: f64,
+}
+
+/// Whether a pointer press should close the open menu.
+///
+/// Presses on the bar are excluded so the menu button keeps its own
+/// toggle, and so switching straight to another menu works: without that
+/// exclusion a click on a menu button would be dismissed here and then
+/// re-opened by the button, leaving it stuck open. Presses inside the
+/// dropdown are excluded because that is where its controls live.
+fn should_dismiss_menu(
+    menu_open: bool,
+    press: Option<egui::Pos2>,
+    bar_rect: egui::Rect,
+    menu_rect: egui::Rect,
+) -> bool {
+    match press {
+        Some(pos) if menu_open => !bar_rect.contains(pos) && !menu_rect.contains(pos),
+        _ => false,
+    }
 }
 
 /// mmap + parse + read the cheap metadata, all before anything is swapped
@@ -358,9 +406,16 @@ impl SenpaiApp {
             nav_keys: NavKeys::default(),
             rebinding: None,
             open_menu: None,
+            bar_rect: egui::Rect::NOTHING,
+            menu_rect: egui::Rect::NOTHING,
+            menu_painting: None,
             pending_open: None,
             open_error: None,
+            render_started: None,
+            last_shown_page: 0,
+            page_pill_until: 0.0,
         };
+        theme::install(&cc.egui_ctx, app.dark_mode);
         if let Some(path) = initial_path {
             app.open_document(&cc.egui_ctx, &path);
             // A bad path on the command line is still worth reporting on
@@ -477,6 +532,9 @@ impl SenpaiApp {
         self.page_count = page_count;
         self.doc_path = Some(path.to_path_buf());
         self.current_page = 0;
+        // Forces the counter pill to flash once on open, so the page
+        // count is visible without having to turn a page first.
+        self.last_shown_page = usize::MAX;
         self.estimated_page_size = estimated_page_size;
         self.known_page_heights = vec![None; page_count];
         self.next_generation = 0;
@@ -528,6 +586,7 @@ impl SenpaiApp {
         }
         self.requested_primary = Some((want.0, want.1, generation));
         self.render_pending = true;
+        self.render_started = None;
     }
 
     /// Used both by Paged mode's +/-1 lookahead (called with a window of
@@ -548,6 +607,13 @@ impl SenpaiApp {
         let mut guard = lock.lock().unwrap();
         push_prefetch_dedup(&mut guard, page, self.scale);
         cvar.notify_one();
+    }
+
+    /// Single exit for the menu, so an armed key-rebind can't be left
+    /// listening behind a dropdown that is no longer on screen.
+    fn close_menu(&mut self) {
+        self.open_menu = None;
+        self.rebinding = None;
     }
 
     fn clear_pending_prefetch(&mut self) {
@@ -642,11 +708,7 @@ impl SenpaiApp {
 
     fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
         self.dark_mode = dark;
-        ctx.set_visuals(if dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        theme::install(ctx, dark);
     }
 
     fn estimated_row_height(&self, page: usize) -> f32 {
@@ -660,6 +722,24 @@ impl SenpaiApp {
 impl eframe::App for SenpaiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pending_evictions.clear();
+
+        // Click anywhere off the chrome to dismiss an open menu. Checked
+        // before the bar is drawn, against last frame's geometry, so a
+        // press on a menu button still reaches that button.
+        let press = ctx.input(|i| {
+            i.pointer
+                .any_pressed()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        if should_dismiss_menu(
+            self.open_menu.is_some(),
+            press,
+            self.bar_rect,
+            self.menu_rect,
+        ) {
+            self.close_menu();
+        }
 
         if let Some(target) = self.rebinding {
             let (escape, captured) = ctx.input(|i| {
@@ -731,7 +811,7 @@ impl eframe::App for SenpaiApp {
                 self.open_menu = Some(Menu::Options);
             }
             if escape {
-                self.open_menu = None;
+                self.close_menu();
             }
         }
 
@@ -757,11 +837,15 @@ impl eframe::App for SenpaiApp {
             egui::Color32::from_gray(235)
         };
 
+        // The bar fades rather than popping: it appears and disappears on
+        // nothing more than pointer position, and a hard cut there reads
+        // as a glitch. Keep painting it until the fade has finished.
+        let bar_t =
+            ctx.animate_bool_with_time(egui::Id::new("bar_fade"), bar_visible, theme::T_PANEL);
+
         if self.page_count == 0 {
             self.show_empty_state(ctx, bg);
-            if bar_visible {
-                self.show_top_bar(ctx);
-            }
+            self.show_top_bar(ctx, bar_t);
             return;
         }
 
@@ -784,13 +868,75 @@ impl eframe::App for SenpaiApp {
             }
         }
 
-        if bar_visible {
-            self.show_top_bar(ctx);
-        }
+        self.show_status_pills(ctx);
+        self.show_top_bar(ctx, bar_t);
     }
 }
 
 impl SenpaiApp {
+    /// The two transient capsules: a render hint at bottom-left and a page
+    /// counter at bottom-centre.
+    ///
+    /// Both are time-gated rather than bound directly to state. The render
+    /// hint waits out `RENDER_HINT_DELAY` so a cache hit -- microseconds --
+    /// never flashes a spinner, and the page counter lingers briefly after
+    /// a turn instead of sitting on screen permanently, since in a reader
+    /// it is reassurance, not chrome.
+    fn show_status_pills(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+
+        let pending = match self.view_mode {
+            ViewMode::Paged => self.render_pending,
+            ViewMode::Continuous => self.continuous_render_pending,
+        };
+        if pending {
+            if self.render_started.is_none() {
+                self.render_started = Some(now);
+            }
+        } else {
+            self.render_started = None;
+        }
+        let show_hint = self
+            .render_started
+            .map(|t0| (now - t0) as f32 >= RENDER_HINT_DELAY)
+            .unwrap_or(false);
+        if pending && !show_hint {
+            // Wake up once the delay has elapsed, or a render that
+            // finishes nothing else would repaint for leaves the hint
+            // permanently un-shown.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(RENDER_HINT_DELAY));
+        }
+        let hint_t =
+            ctx.animate_bool_with_time(egui::Id::new("render_hint"), show_hint, theme::T_PANEL);
+        theme::status_pill(
+            ctx,
+            "render_hint_pill",
+            egui::Align2::LEFT_BOTTOM,
+            egui::vec2(16.0, -16.0),
+            hint_t,
+            "rendering…",
+        );
+
+        if self.current_page != self.last_shown_page {
+            self.last_shown_page = self.current_page;
+            self.page_pill_until = now + 1.4;
+        }
+        let page_visible = now < self.page_pill_until;
+        if page_visible {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.1));
+        }
+        let page_t =
+            ctx.animate_bool_with_time(egui::Id::new("page_pill"), page_visible, theme::T_PANEL);
+        theme::status_pill(
+            ctx,
+            "page_counter_pill",
+            egui::Align2::CENTER_BOTTOM,
+            egui::vec2(0.0, -16.0),
+            page_t,
+            &format!("{} / {}", self.current_page + 1, self.page_count),
+        );
+    }
+
     /// Shown when no document is open -- on launch without a path, or
     /// after a failed open. Deliberately just a prompt and a button: the
     /// reader has nothing to be fast about yet.
@@ -800,38 +946,53 @@ impl SenpaiApp {
         } else {
             egui::Color32::from_gray(110)
         };
+        let strong = if self.dark_mode {
+            egui::Color32::from_gray(205)
+        } else {
+            egui::Color32::from_gray(70)
+        };
+        // Eased in on first paint, so launching into the empty state is a
+        // fade rather than a snap from blank to populated.
+        let intro = ctx.animate_bool_with_time(egui::Id::new("empty_intro"), true, 0.35);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg))
             .show(ctx, |ui| {
+                ui.set_opacity(intro);
                 ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() * 0.35);
+                    ui.add_space(ui.available_height() * 0.32);
+                    ui.label(egui::RichText::new("senpai").color(dim).size(13.0));
+                    ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("no document open")
-                            .color(dim)
-                            .size(20.0),
+                        egui::RichText::new("No document open")
+                            .color(strong)
+                            .size(22.0),
                     );
-                    ui.add_space(12.0);
+                    ui.add_space(20.0);
+
                     let waiting = self.pending_open.is_some();
-                    let label = if waiting {
-                        "choosing…"
-                    } else {
-                        "Open a PDF…"
-                    };
-                    if ui.add_enabled(!waiting, egui::Button::new(label)).clicked() {
+                    let clicked = Pill::new(if waiting { "Choosing…" } else { "Open a PDF" })
+                        .style(PillStyle::Accent)
+                        .enabled(!waiting)
+                        .min_width(150.0)
+                        .show(ui)
+                        .clicked();
+                    if clicked {
                         self.begin_open_dialog(ctx);
                     }
-                    ui.add_space(8.0);
+
+                    ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Ctrl+O, or Files → Open")
+                        egui::RichText::new("Ctrl+O, or the Files menu")
                             .color(dim)
-                            .small(),
+                            .size(11.5),
                     );
                     if let Some(err) = &self.open_error {
-                        ui.add_space(18.0);
+                        ui.add_space(22.0);
                         ui.label(
                             egui::RichText::new(err)
-                                .color(egui::Color32::from_rgb(220, 110, 110))
-                                .small(),
+                                .color(egui::Color32::from_rgb(224, 120, 120))
+                                .size(11.5),
                         );
                     }
                 });
@@ -852,20 +1013,6 @@ impl SenpaiApp {
                         ui.image((tex.id(), draw_size));
                     });
                 }
-
-                if self.render_pending {
-                    ui.put(
-                        egui::Rect::from_min_size(
-                            egui::pos2(12.0, ui.clip_rect().height() - 28.0),
-                            egui::vec2(120.0, 20.0),
-                        ),
-                        egui::Label::new(
-                            egui::RichText::new("rendering…")
-                                .color(egui::Color32::from_gray(160))
-                                .small(),
-                        ),
-                    );
-                }
             });
     }
 
@@ -873,6 +1020,7 @@ impl SenpaiApp {
     /// Deferred to a follow-up; left in place so it's opt-in-only and
     /// doesn't block shipping Paged mode, which is working.
     fn show_continuous_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
+        let dark = self.dark_mode;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg))
             .show(ctx, |ui| {
@@ -922,12 +1070,31 @@ impl SenpaiApp {
                                         });
                                     } else {
                                         any_missing = true;
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("page {}", page + 1))
-                                                    .color(egui::Color32::from_gray(100)),
-                                            );
-                                        });
+                                        // A soft placeholder card, so an
+                                        // un-rendered page reads as "this
+                                        // page exists, pixels are coming"
+                                        // rather than as a gap.
+                                        let area = ui.max_rect();
+                                        let card = area.shrink2(egui::vec2(
+                                            (area.width() * 0.12).min(90.0),
+                                            6.0,
+                                        ));
+                                        ui.painter().rect_filled(
+                                            card,
+                                            egui::Rounding::same(theme::R_CARD),
+                                            if dark {
+                                                egui::Color32::from_gray(44)
+                                            } else {
+                                                egui::Color32::from_gray(222)
+                                            },
+                                        );
+                                        ui.painter().text(
+                                            card.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}", page + 1),
+                                            egui::FontId::proportional(13.0),
+                                            egui::Color32::from_gray(if dark { 110 } else { 150 }),
+                                        );
                                     }
                                 },
                             );
@@ -946,249 +1113,348 @@ impl SenpaiApp {
 
                         self.continuous_render_pending = any_missing;
                     });
-
-                if self.continuous_render_pending {
-                    ui.put(
-                        egui::Rect::from_min_size(
-                            egui::pos2(12.0, ui.clip_rect().height() - 28.0),
-                            egui::vec2(120.0, 20.0),
-                        ),
-                        egui::Label::new(
-                            egui::RichText::new("rendering…")
-                                .color(egui::Color32::from_gray(160))
-                                .small(),
-                        ),
-                    );
-                }
             });
     }
 
-    fn show_top_bar(&mut self, ctx: &egui::Context) {
-        let bar_frame = egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(230))
-            .rounding(egui::Rounding::same(18.0))
-            .inner_margin(egui::Margin::symmetric(20.0, 10.0));
+    /// The top bar. `fade` is 0..1 from the caller's animation, so the bar
+    /// can slide/fade in and out instead of popping on hover.
+    fn show_top_bar(&mut self, ctx: &egui::Context, fade: f32) {
+        if fade <= 0.001 {
+            // Fully hidden: don't paint, and crucially don't register the
+            // bar's click targets, or an invisible bar would still eat
+            // clicks meant for the page.
+            self.close_menu();
+            self.menu_painting = None;
+            self.bar_rect = egui::Rect::NOTHING;
+            self.menu_rect = egui::Rect::NOTHING;
+            return;
+        }
 
         let screen_width = ctx.screen_rect().width();
         let bar_width = (screen_width - 80.0).clamp(280.0, 900.0);
 
-        egui::Area::new(egui::Id::new("top_bar"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+        // Slides down into place as it fades. A few pixels of travel is
+        // what separates "appeared" from "arrived". Note the direction:
+        // it starts tucked up against the edge (2) and settles at its
+        // resting offset (12), not the other way round.
+        let slide = 2.0 + 10.0 * egui::emath::easing::cubic_out(fade);
+
+        let bar = egui::Area::new(egui::Id::new("top_bar"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, slide))
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                ui.set_opacity(fade);
                 ui.set_width(bar_width);
-                bar_frame.show(ui, |ui| {
-                    ui.set_width(bar_width - 40.0);
-                    ui.horizontal(|ui| {
-                        self.menu_button(ui, "Files", Menu::Files);
-                        self.menu_button(ui, "Tools", Menu::Tools);
-                        self.menu_button(ui, "Modes", Menu::Modes);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            self.menu_button(ui, "Options", Menu::Options);
+                theme::chrome_frame(theme::R_PILL)
+                    .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.set_width(bar_width - 20.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            self.menu_button(ui, "Files", Menu::Files);
+                            self.menu_button(ui, "Tools", Menu::Tools);
+                            self.menu_button(ui, "Modes", Menu::Modes);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    self.menu_button(ui, "Options", Menu::Options);
+                                },
+                            );
                         });
                     });
-                });
             });
+        self.bar_rect = bar.response.rect;
 
-        if let Some(menu) = self.open_menu {
-            self.show_menu_dropdown(ctx, menu, bar_width);
+        // Painted from `menu_painting`, not `open_menu`, so closing
+        // animates symmetrically with opening instead of cutting out.
+        if self.open_menu.is_some() {
+            self.menu_painting = self.open_menu;
+        } else {
+            // Nothing open: forget the dropdown's old rect, or a click
+            // where it used to be would silently count as "on the menu".
+            self.menu_rect = egui::Rect::NOTHING;
+        }
+        let open_t = ctx.animate_bool_with_time(
+            egui::Id::new("menu_fade"),
+            self.open_menu.is_some(),
+            theme::T_PANEL,
+        );
+        if open_t <= 0.001 {
+            self.menu_painting = None;
+        } else if let Some(menu) = self.menu_painting {
+            // A menu on its way out must not take clicks: it is still
+            // visible, but it is no longer the open menu.
+            let closing = self.open_menu.is_none();
+            self.show_menu_dropdown(ctx, menu, bar_width, open_t * fade, closing);
         }
     }
 
     fn menu_button(&mut self, ui: &mut egui::Ui, label: &str, kind: Menu) {
         let selected = self.open_menu == Some(kind);
-        let text = egui::RichText::new(label).color(egui::Color32::WHITE);
-        let button = egui::Button::new(text).fill(if selected {
-            egui::Color32::from_white_alpha(30)
-        } else {
-            egui::Color32::TRANSPARENT
-        });
-        if ui.add(button).clicked() {
-            self.open_menu = if selected { None } else { Some(kind) };
+        if Pill::new(label).selected(selected).show(ui).clicked() {
+            if selected {
+                self.close_menu();
+            } else {
+                self.open_menu = Some(kind);
+            }
         }
     }
 
-    fn show_menu_dropdown(&mut self, ctx: &egui::Context, menu: Menu, bar_width: f32) {
-        let frame = egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(235))
-            .rounding(egui::Rounding::same(14.0))
-            .inner_margin(egui::Margin::symmetric(16.0, 12.0));
+    fn show_menu_dropdown(
+        &mut self,
+        ctx: &egui::Context,
+        menu: Menu,
+        bar_width: f32,
+        fade: f32,
+        closing: bool,
+    ) {
+        if fade <= 0.001 {
+            return;
+        }
+        let slide = 62.0 + 6.0 * egui::emath::easing::cubic_out(fade);
 
-        egui::Area::new(egui::Id::new("menu_dropdown"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 68.0))
+        let dropdown = egui::Area::new(egui::Id::new("menu_dropdown"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, slide))
+            .order(egui::Order::Foreground)
+            .interactable(!closing)
             .show(ctx, |ui| {
-                ui.set_width(bar_width.min(340.0));
-                frame.show(ui, |ui| match menu {
-                    Menu::Files => {
-                        let waiting = self.pending_open.is_some();
-                        let label = if waiting {
-                            "Open... (dialog open)"
-                        } else {
-                            "Open...   Ctrl+O"
-                        };
-                        if ui
-                            .add_enabled(
-                                !waiting,
-                                egui::Button::new(
-                                    egui::RichText::new(label).color(egui::Color32::WHITE),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.begin_open_dialog(ctx);
-                            self.open_menu = None;
+                ui.set_opacity(fade);
+                // Fixed width, set *inside* the frame: letting each menu
+                // size to its own content made the card visibly resize
+                // when switching between them.
+                let panel_width = bar_width.min(330.0);
+                theme::chrome_frame(theme::R_CARD)
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(panel_width);
+                        ui.spacing_mut().item_spacing.y = 7.0;
+                        match menu {
+                            Menu::Files => self.menu_files(ui, ctx),
+                            Menu::Tools => self.menu_tools(ui),
+                            Menu::Modes => self.menu_modes(ui, ctx),
+                            Menu::Options => self.menu_options(ui),
                         }
-                        if let Some(path) = &self.doc_path {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(path.display().to_string())
-                                    .color(egui::Color32::GRAY)
-                                    .small(),
-                            );
-                        }
-                        if let Some(err) = &self.open_error {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(err)
-                                    .color(egui::Color32::from_rgb(220, 110, 110))
-                                    .small(),
-                            );
-                        }
-                    }
-                    Menu::Tools => {
-                        ui.label(
-                            egui::RichText::new("Annotation tools (coming soon)")
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(
-                                egui::RichText::new("Highlight").color(egui::Color32::GRAY),
-                            ),
-                        );
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(
-                                egui::RichText::new("Note").color(egui::Color32::GRAY),
-                            ),
-                        );
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(
-                                egui::RichText::new("Draw").color(egui::Color32::GRAY),
-                            ),
-                        );
-                    }
-                    Menu::Modes => {
-                        ui.label(
-                            egui::RichText::new("Theme")
-                                .color(egui::Color32::GRAY)
-                                .small(),
-                        );
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(egui::Button::new(
-                                    egui::RichText::new("Light").color(egui::Color32::WHITE),
-                                ))
-                                .clicked()
-                            {
-                                self.set_dark(ctx, false);
-                            }
-                            if ui
-                                .add(egui::Button::new(
-                                    egui::RichText::new("Night").color(egui::Color32::WHITE),
-                                ))
-                                .clicked()
-                            {
-                                self.set_dark(ctx, true);
-                            }
-                        });
-
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new("View mode")
-                                .color(egui::Color32::GRAY)
-                                .small(),
-                        );
-                        ui.horizontal(|ui| {
-                            let paged_selected = self.view_mode == ViewMode::Paged;
-                            let paged_btn = egui::Button::new(
-                                egui::RichText::new("Paged").color(egui::Color32::WHITE),
-                            )
-                            .fill(if paged_selected {
-                                egui::Color32::from_white_alpha(30)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            });
-                            if ui.add(paged_btn).clicked() {
-                                self.set_view_mode(ViewMode::Paged);
-                            }
-
-                            let cont_selected = self.view_mode == ViewMode::Continuous;
-                            let cont_btn = egui::Button::new(
-                                egui::RichText::new("Continuous Scroll (experimental)")
-                                    .color(egui::Color32::WHITE),
-                            )
-                            .fill(if cont_selected {
-                                egui::Color32::from_white_alpha(30)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            });
-                            if ui.add(cont_btn).clicked() {
-                                self.set_view_mode(ViewMode::Continuous);
-                            }
-                        });
-
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new("Page navigation keys (Paged mode)")
-                                .color(egui::Color32::GRAY)
-                                .small(),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Prev: {:?}", self.nav_keys.prev))
-                                    .color(egui::Color32::WHITE),
-                            );
-                            let rebinding_prev = self.rebinding == Some(NavTarget::Prev);
-                            let label = if rebinding_prev {
-                                "press any key…"
-                            } else {
-                                "Rebind"
-                            };
-                            if ui.button(label).clicked() {
-                                self.rebinding = Some(NavTarget::Prev);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Next: {:?}", self.nav_keys.next))
-                                    .color(egui::Color32::WHITE),
-                            );
-                            let rebinding_next = self.rebinding == Some(NavTarget::Next);
-                            let label = if rebinding_next {
-                                "press any key…"
-                            } else {
-                                "Rebind"
-                            };
-                            if ui.button(label).clicked() {
-                                self.rebinding = Some(NavTarget::Next);
-                            }
-                        });
-                        if self.rebinding.is_some() {
-                            ui.label(
-                                egui::RichText::new("Press Escape to cancel")
-                                    .color(egui::Color32::from_gray(150))
-                                    .small(),
-                            );
-                        }
-                    }
-                    Menu::Options => {
-                        let mut auto_hide = self.auto_hide_enabled;
-                        if ui.checkbox(&mut auto_hide, "Enable auto-hide").changed() {
-                            self.auto_hide_enabled = auto_hide;
-                        }
-                    }
-                });
+                    });
             });
+        // A dropdown on its way out must stop counting as "inside the
+        // menu", or a click during the fade would be swallowed.
+        self.menu_rect = if closing {
+            egui::Rect::NOTHING
+        } else {
+            dropdown.response.rect
+        };
+    }
+
+    fn menu_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        theme::section_label(ui, "Document");
+        let waiting = self.pending_open.is_some();
+        let clicked = Pill::new(if waiting {
+            "Dialog open…"
+        } else {
+            "Open…   Ctrl+O"
+        })
+        .style(PillStyle::Accent)
+        .enabled(!waiting)
+        .min_width(ui.available_width())
+        .show(ui)
+        .clicked();
+        if clicked {
+            self.begin_open_dialog(ctx);
+            self.close_menu();
+        }
+
+        if let Some(path) = &self.doc_path {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(name).color(theme::TEXT_DIM).size(11.5));
+            ui.label(
+                egui::RichText::new(format!("{} pages", self.page_count))
+                    .color(theme::TEXT_FAINT)
+                    .size(10.5),
+            );
+        }
+        if let Some(err) = &self.open_error {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .color(egui::Color32::from_rgb(224, 120, 120))
+                    .size(11.0),
+            );
+        }
+    }
+
+    fn menu_tools(&mut self, ui: &mut egui::Ui) {
+        theme::section_label(ui, "Annotation");
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for label in ["Highlight", "Note", "Draw"] {
+                Pill::new(label).enabled(false).show(ui);
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Not built yet — Phase 3 in the roadmap.")
+                .color(theme::TEXT_FAINT)
+                .size(10.5),
+        );
+    }
+
+    fn menu_modes(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        theme::section_label(ui, "Theme");
+        let dark = self.dark_mode;
+        if let Some(i) = theme::segmented(ui, "theme_seg", &["Light", "Night"], dark as usize) {
+            self.set_dark(ctx, i == 1);
+        }
+
+        theme::divider(ui);
+        theme::section_label(ui, "View mode");
+        let current = (self.view_mode == ViewMode::Continuous) as usize;
+        if let Some(i) = theme::segmented(ui, "view_seg", &["Paged", "Continuous"], current) {
+            self.set_view_mode(if i == 1 {
+                ViewMode::Continuous
+            } else {
+                ViewMode::Paged
+            });
+        }
+        if self.view_mode == ViewMode::Continuous {
+            ui.label(
+                egui::RichText::new("Experimental — known broken.")
+                    .color(egui::Color32::from_rgb(224, 170, 110))
+                    .size(10.5),
+            );
+        }
+
+        theme::divider(ui);
+        theme::section_label(ui, "Page navigation keys");
+        self.rebind_row(ui, "Previous", NavTarget::Prev);
+        self.rebind_row(ui, "Next", NavTarget::Next);
+        if self.rebinding.is_some() {
+            ui.label(
+                egui::RichText::new("Press any key, or Escape to cancel.")
+                    .color(theme::TEXT_FAINT)
+                    .size(10.5),
+            );
+        }
+    }
+
+    fn rebind_row(&mut self, ui: &mut egui::Ui, label: &str, target: NavTarget) {
+        let key = match target {
+            NavTarget::Prev => self.nav_keys.prev,
+            NavTarget::Next => self.nav_keys.next,
+        };
+        let listening = self.rebinding == Some(target);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).color(theme::TEXT).size(12.5));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let caption = if listening {
+                    "press a key…".to_string()
+                } else {
+                    format!("{key:?}")
+                };
+                let style = if listening {
+                    PillStyle::Selected
+                } else {
+                    PillStyle::Quiet
+                };
+                if Pill::new(&caption)
+                    .style(style)
+                    .small()
+                    .min_width(98.0)
+                    .show(ui)
+                    .clicked()
+                {
+                    self.rebinding = if listening { None } else { Some(target) };
+                }
+            });
+        });
+    }
+
+    fn menu_options(&mut self, ui: &mut egui::Ui) {
+        theme::section_label(ui, "Top bar");
+        let mut auto_hide = self.auto_hide_enabled;
+        if theme::switch_row(ui, "Auto-hide", &mut auto_hide).changed() {
+            self.auto_hide_enabled = auto_hide;
+        }
+        ui.label(
+            egui::RichText::new("Reveal by hovering the top edge, or Alt+F / T / M / O.")
+                .color(theme::TEXT_FAINT)
+                .size(10.5),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_dismiss_menu;
+    use eframe::egui::{pos2, Rect};
+
+    fn bar() -> Rect {
+        Rect::from_min_max(pos2(50.0, 12.0), pos2(950.0, 60.0))
+    }
+    fn menu() -> Rect {
+        Rect::from_min_max(pos2(320.0, 68.0), pos2(680.0, 300.0))
+    }
+
+    #[test]
+    fn click_on_the_page_dismisses() {
+        assert!(should_dismiss_menu(
+            true,
+            Some(pos2(500.0, 500.0)),
+            bar(),
+            menu()
+        ));
+    }
+
+    /// The bar is excluded so a menu button keeps its own toggle, and so
+    /// switching straight to another menu works. Dismissing here would
+    /// close the menu and let the button immediately reopen it.
+    #[test]
+    fn click_on_the_bar_does_not_dismiss() {
+        assert!(!should_dismiss_menu(
+            true,
+            Some(pos2(90.0, 34.0)),
+            bar(),
+            menu()
+        ));
+    }
+
+    #[test]
+    fn click_inside_the_dropdown_does_not_dismiss() {
+        assert!(!should_dismiss_menu(
+            true,
+            Some(pos2(500.0, 150.0)),
+            bar(),
+            menu()
+        ));
+    }
+
+    #[test]
+    fn nothing_happens_without_a_press() {
+        assert!(!should_dismiss_menu(true, None, bar(), menu()));
+    }
+
+    #[test]
+    fn no_open_menu_means_nothing_to_dismiss() {
+        assert!(!should_dismiss_menu(
+            false,
+            Some(pos2(500.0, 500.0)),
+            bar(),
+            menu()
+        ));
+    }
+
+    /// Guards the reset paths: with the rects cleared, any press counts as
+    /// outside, so a stale rect can never swallow a dismissing click.
+    #[test]
+    fn cleared_rects_still_dismiss() {
+        assert!(should_dismiss_menu(
+            true,
+            Some(pos2(500.0, 150.0)),
+            Rect::NOTHING,
+            Rect::NOTHING
+        ));
     }
 }
