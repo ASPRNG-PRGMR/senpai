@@ -57,7 +57,11 @@ impl PdfEngine for PopplerEngine {
         let author = self.doc.get_author();
         DocumentMetadata {
             title: if title.is_empty() { None } else { Some(title) },
-            author: if author.is_empty() { None } else { Some(author) },
+            author: if author.is_empty() {
+                None
+            } else {
+                Some(author)
+            },
             page_count: self.doc.page_count().max(0) as usize,
         }
     }

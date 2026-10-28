@@ -8,6 +8,38 @@
 
 namespace senpai_poppler {
 
+namespace {
+
+/// Converts a poppler::ustring (UTF-16 internally) into a rust::String.
+///
+/// Two things here are load-bearing, both learned the hard way:
+///
+///   1. to_utf8(), not to_latin1(). Latin-1 output is raw bytes in
+///      0x80..0xFF for any accented character, which is not valid UTF-8 —
+///      and rust::String's constructor *throws* on invalid UTF-8. With
+///      `panic = "abort"` in the release profile that throw terminated the
+///      whole process: a single non-ASCII character anywhere in a title,
+///      author, or page of text was enough to kill the reader.
+///   2. rust::String::lossy, not the throwing constructor. Even correct
+///      UTF-8 conversion can't be trusted blindly for arbitrary, possibly
+///      malformed documents, and no text-extraction result is worth
+///      aborting over. Invalid sequences become U+FFFD instead.
+rust::String to_rust_string(const poppler::ustring &s) {
+    poppler::byte_array utf8 = s.to_utf8();
+    // Some poppler versions NUL-terminate the byte_array; a trailing NUL
+    // would otherwise end up inside the Rust String as a real character.
+    size_t len = utf8.size();
+    while (len > 0 && utf8[len - 1] == '\0') {
+        --len;
+    }
+    if (len == 0) {
+        return rust::String("");
+    }
+    return rust::String::lossy(utf8.data(), len);
+}
+
+} // namespace
+
 RenderedImage::RenderedImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba)
     : width_(width), height_(height), rgba_(std::move(rgba)) {}
 
@@ -28,11 +60,11 @@ int PopplerDocument::page_count() const {
 }
 
 rust::String PopplerDocument::get_title() const {
-    return rust::String(impl->doc->get_title().to_latin1());
+    return to_rust_string(impl->doc->get_title());
 }
 
 rust::String PopplerDocument::get_author() const {
-    return rust::String(impl->doc->get_author().to_latin1());
+    return to_rust_string(impl->doc->get_author());
 }
 
 PageSize PopplerDocument::page_size(int index) const {
@@ -91,7 +123,7 @@ rust::String PopplerDocument::page_text(int index) const {
     if (!p) {
         return rust::String("");
     }
-    return rust::String(p->text().to_latin1());
+    return to_rust_string(p->text());
 }
 
 std::unique_ptr<PopplerDocument> open_document(const uint8_t *data, size_t len) {

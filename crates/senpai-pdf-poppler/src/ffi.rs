@@ -5,6 +5,10 @@
 //! above it only sees `crate::PopplerEngine`, which implements the
 //! backend-agnostic `PdfEngine` trait.
 
+// `ffi::ffi` reads oddly, but the inner module name is the one cxx's own
+// documentation and examples use, and it's what every cxx codebase looks
+// like -- worth more here than satisfying the lint.
+#[allow(clippy::module_inception)]
 #[cxx::bridge(namespace = "senpai_poppler")]
 pub mod ffi {
     struct PageSize {

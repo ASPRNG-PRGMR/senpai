@@ -9,8 +9,9 @@ fn main() {
         // (Linux) libraries, so it's useless here. Instead we point
         // directly at the MSYS2-derived mingw64 sysroot fetched by
         // fetch-mingw64-sysroot.sh.
-        let sysroot = std::env::var("SENPAI_MINGW_SYSROOT")
-            .expect("set SENPAI_MINGW_SYSROOT to the mingw64-sysroot path (see fetch-mingw64-sysroot.sh)");
+        let sysroot = std::env::var("SENPAI_MINGW_SYSROOT").expect(
+            "set SENPAI_MINGW_SYSROOT to the mingw64-sysroot path (see fetch-mingw64-sysroot.sh)",
+        );
 
         // poppler-cpp's own headers.
         build.include(format!("{sysroot}/mingw64/include/poppler/cpp"));

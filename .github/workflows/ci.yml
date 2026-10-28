@@ -1,0 +1,106 @@
+# Phase 0's last open item (see ROADMAP.md).
+#
+# Deliberately scoped to what can actually fail in CI without a GPU or a
+# display: formatting, lints, the engine test suite, and -- the one that
+# breaks most silently -- the Windows cross-build, which depends on an
+# externally fetched mingw64 sysroot that nothing else would notice going
+# stale.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning that CI tolerates is a warning that accumulates.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  linux:
+    name: lint + test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # poppler-cpp + pkg-config: the native path in
+          # crates/senpai-pdf-poppler/build.rs.
+          # xkbcommon/X11/wayland headers: winit's platform backends,
+          # which eframe needs even for a build-only check.
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libpoppler-cpp-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build (release)
+        run: cargo build --workspace --release
+
+  windows-cross:
+    name: cross-build (windows-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zstd zip
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu
+
+      # The sysroot is ~300MB of MSYS2 packages; cache it on the fetch
+      # script rather than re-downloading the mirror on every push.
+      - name: Cache mingw64 sysroot
+        id: sysroot
+        uses: actions/cache@v4
+        with:
+          path: mingw64-sysroot
+          key: mingw64-sysroot-${{ hashFiles('fetch-mingw64-sysroot.sh') }}
+
+      - name: Fetch mingw64 sysroot
+        if: steps.sysroot.outputs.cache-hit != 'true'
+        run: ./fetch-mingw64-sysroot.sh
+
+      # Also exercises the transitive PE import walk that decides which
+      # DLLs ship, so a missing or renamed dependency fails here instead
+      # of on a user's machine.
+      - name: Package Windows zip
+        run: ./package-windows.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: senpai-windows-x64
+          path: target/package/*.zip
+          if-no-files-found: error
