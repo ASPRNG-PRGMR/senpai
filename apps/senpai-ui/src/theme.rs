@@ -517,3 +517,93 @@ pub fn status_pill(
                 });
         });
 }
+
+// ── Drag-and-drop overlay ────────────────────────────────────────────────
+
+/// The veil shown while files are being dragged over the window.
+///
+/// Painted straight onto its own layer above `Order::Foreground` rather
+/// than into a panel, for two reasons: it has to cover the page *and*
+/// the top bar (during a drag, the only question on screen is whether
+/// letting go will do something), and update() has more than one exit
+/// path, so a single unconditional call at the top beats repeating it
+/// at each one.
+///
+/// `t` is the usual 0..1 fade. At 0 nothing is drawn at all, so a
+/// fully-faded overlay costs one comparison.
+pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
+    if t <= 0.001 {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("drop_overlay"),
+    ));
+
+    painter.rect_filled(
+        screen,
+        Rounding::ZERO,
+        Color32::from_black_alpha((150.0 * t) as u8),
+    );
+
+    // The border eases inward as it appears, which reads as the window
+    // accepting the drag rather than a rectangle blinking on.
+    let inset = screen.shrink(16.0 + 10.0 * (1.0 - t));
+    painter.rect_stroke(
+        inset,
+        Rounding::same(R_CARD + 6.0),
+        Stroke::new(2.0_f32, ACCENT.gamma_multiply(t * 0.85)),
+    );
+
+    let title = painter.layout_no_wrap(
+        "Drop to open".to_owned(),
+        egui::FontId::proportional(15.0),
+        TEXT.gamma_multiply(t),
+    );
+    let sub = label.map(|l| {
+        painter.layout_no_wrap(
+            l.to_owned(),
+            egui::FontId::proportional(11.5),
+            TEXT_DIM.gamma_multiply(t),
+        )
+    });
+
+    let text_w = title.size().x.max(sub.as_ref().map_or(0.0, |g| g.size().x));
+    let card = Rect::from_center_size(
+        screen.center(),
+        vec2(
+            (text_w + 48.0).max(200.0),
+            if sub.is_some() { 74.0 } else { 56.0 },
+        ),
+    );
+    let rounding = Rounding::same(R_CARD);
+    painter.add(soft_shadow(t).as_shape(card, rounding));
+    painter.rect_filled(card, rounding, CHROME.gamma_multiply(t));
+    painter.rect_stroke(
+        card,
+        rounding,
+        Stroke::new(1.0_f32, HAIRLINE.gamma_multiply(t)),
+    );
+
+    let title_y = if sub.is_some() {
+        card.center().y - 10.0
+    } else {
+        card.center().y
+    };
+    painter.galley(
+        pos2(
+            card.center().x - title.size().x / 2.0,
+            title_y - title.size().y / 2.0,
+        ),
+        title,
+        Color32::WHITE,
+    );
+    if let Some(sub) = sub {
+        painter.galley(
+            pos2(card.center().x - sub.size().x / 2.0, card.center().y + 6.0),
+            sub,
+            Color32::WHITE,
+        );
+    }
+}

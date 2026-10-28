@@ -150,6 +150,25 @@ const RECENT_IN_MENU: usize = 6;
 /// the pill wider than the card.
 const RECENT_NAME_CHARS: usize = 34;
 
+/// Picks which of several dropped files to open.
+///
+/// A `.pdf` wins outright. Failing that the first file is taken anyway
+/// rather than the drop being ignored: a PDF with no extension is a real
+/// thing, and when it genuinely is not one, letting the loader fail says
+/// which file and why -- which silently doing nothing does not.
+fn pick_dropped_pdf(paths: &[PathBuf]) -> Option<&Path> {
+    paths
+        .iter()
+        .find(|p| is_pdf(p))
+        .or_else(|| paths.first())
+        .map(PathBuf::as_path)
+}
+
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
 /// Shortens `text` to `max` characters by dropping its middle.
 ///
 /// The tail is kept rather than cut because that is where a file name
@@ -370,6 +389,10 @@ struct SenpaiApp {
     /// Documents opened before, newest first. Also decides where the
     /// file dialog starts -- see the note at the top of `recent.rs`.
     recent: recent::Recent,
+    /// Name shown on the drag-and-drop overlay. Kept after the pointer
+    /// leaves so the card still reads correctly while it fades out --
+    /// clearing it with the hover would blank the text mid-fade.
+    drop_label: Option<String>,
 
     /// When the current render request started, for `RENDER_HINT_DELAY`.
     render_started: Option<f64>,
@@ -448,6 +471,7 @@ impl SenpaiApp {
             pending_open: None,
             open_error: None,
             recent: recent::Recent::load(),
+            drop_label: None,
             render_started: None,
             last_shown_page: 0,
             page_pill_until: 0.0,
@@ -512,6 +536,50 @@ impl SenpaiApp {
             // User cancelled, or the dialog thread died without answering.
             Ok(None) | Err(TryRecvError::Disconnected) => self.pending_open = None,
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Opens a file dragged onto the window, and paints the overlay that
+    /// says so while a drag is in progress.
+    ///
+    /// Both halves live here because they read the same input: egui
+    /// reports an in-flight drag as `hovered_files` and a completed one
+    /// as `dropped_files`, and the overlay is simply the first of those
+    /// made visible.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let (hovering, hovered_name, dropped) = ctx.input(|i| {
+            let hovering = !i.raw.hovered_files.is_empty();
+            // A path is not always attached -- some platforms only name
+            // the file on the drop itself -- so the card falls back to
+            // its title alone rather than showing an empty line.
+            let name = i
+                .raw
+                .hovered_files
+                .iter()
+                .find_map(|f| f.path.as_deref())
+                .and_then(|p| p.file_name())
+                .map(|n| elide(&n.to_string_lossy(), RECENT_NAME_CHARS));
+            let dropped: Vec<PathBuf> = i
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect();
+            (hovering, name, dropped)
+        });
+        if hovering {
+            self.drop_label = hovered_name;
+        }
+
+        let t = ctx.animate_bool_with_time(egui::Id::new("drop_fade"), hovering, theme::T_PANEL);
+        theme::drop_overlay(ctx, t, self.drop_label.as_deref());
+
+        if let Some(path) = pick_dropped_pdf(&dropped) {
+            let path = path.to_path_buf();
+            // A drop is a deliberate "open this now"; a menu left open
+            // over the top of it would just be in the way.
+            self.close_menu();
+            self.open_document(ctx, &path);
         }
     }
 
@@ -787,6 +855,8 @@ impl eframe::App for SenpaiApp {
             self.close_menu();
         }
 
+        self.handle_dropped_files(ctx);
+
         if let Some(target) = self.rebinding {
             let (escape, captured) = ctx.input(|i| {
                 let escape = i.key_pressed(egui::Key::Escape);
@@ -1029,7 +1099,7 @@ impl SenpaiApp {
 
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Ctrl+O, or the Files menu")
+                        egui::RichText::new("Drop a PDF here, or press Ctrl+O")
                             .color(dim)
                             .size(11.5),
                     );
@@ -1483,8 +1553,9 @@ impl SenpaiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{elide, should_dismiss_menu, RECENT_NAME_CHARS};
+    use super::{elide, pick_dropped_pdf, should_dismiss_menu, RECENT_NAME_CHARS};
     use eframe::egui::{pos2, Rect};
+    use std::path::{Path, PathBuf};
 
     fn bar() -> Rect {
         Rect::from_min_max(pos2(50.0, 12.0), pos2(950.0, 60.0))
@@ -1582,5 +1653,36 @@ mod tests {
     #[test]
     fn elide_falls_back_to_truncation_when_there_is_no_middle() {
         assert_eq!(elide("abcdefg", 3), "abc");
+    }
+
+    fn paths(items: &[&str]) -> Vec<PathBuf> {
+        items.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn nothing_dropped_opens_nothing() {
+        assert_eq!(pick_dropped_pdf(&[]), None);
+    }
+
+    #[test]
+    fn a_pdf_wins_over_whatever_else_came_with_it() {
+        let dropped = paths(&["/notes.txt", "/book.pdf", "/other.pdf"]);
+        assert_eq!(pick_dropped_pdf(&dropped), Some(Path::new("/book.pdf")));
+    }
+
+    /// Dragging from a file manager can produce an upper-case extension,
+    /// and on Windows the case carries no meaning at all.
+    #[test]
+    fn the_extension_match_ignores_case() {
+        let dropped = paths(&["/notes.txt", "/BOOK.PDF"]);
+        assert_eq!(pick_dropped_pdf(&dropped), Some(Path::new("/BOOK.PDF")));
+    }
+
+    /// Not a refusal: the loader gets to say what is wrong with it, by
+    /// name. An extensionless PDF opens by this path too.
+    #[test]
+    fn without_a_pdf_the_first_file_is_tried_anyway() {
+        let dropped = paths(&["/scan", "/notes.txt"]);
+        assert_eq!(pick_dropped_pdf(&dropped), Some(Path::new("/scan")));
     }
 }
