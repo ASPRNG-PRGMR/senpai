@@ -841,24 +841,40 @@ fn body(ui: &mut egui::Ui, block: &Block, base: f32, zoom: f32, pal: &Palette) {
                 });
         }
         BlockKind::Table { head, rows } => {
+            let cols = head
+                .len()
+                .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+                .max(1);
+            let gap = 16.0 * zoom;
+            // Each column is capped at an equal share of the room, and
+            // cells wrap inside it.
+            //
+            // They used not to, on the reasoning that a grid hands each
+            // column the width it asks for and that cells are short. The
+            // second half was wrong: a documentation table whose cells
+            // are whole sentences asked for a column wider than the
+            // window, and because the reading column is measured from
+            // the space available, that one table widened every
+            // paragraph in the document with it.
+            //
+            // The cap is a ceiling rather than a fixed width, so a
+            // column of "Yes"/"No" still comes out narrow and only the
+            // column that wants more than its share has to wrap.
+            let cap = table_column_cap(ui.available_width(), cols, gap);
             egui::Grid::new(ui.next_auto_id())
                 .striped(true)
-                .spacing(egui::vec2(16.0 * zoom, 7.0 * zoom))
+                .spacing(egui::vec2(gap, 7.0 * zoom))
+                .max_col_width(cap)
                 .show(ui, |ui| {
                     if !head.is_empty() {
                         for cell in head {
-                            // Cells do not wrap: a grid hands each column
-                            // the width it asks for, so wrapping inside
-                            // one makes column widths depend on their own
-                            // contents' wrapping. Short cells are the
-                            // overwhelmingly common case.
-                            inline(ui, cell, base * 0.95, true, false, pal);
+                            inline(ui, cell, base * 0.95, true, true, pal);
                         }
                         ui.end_row();
                     }
                     for row in rows {
                         for cell in row {
-                            inline(ui, cell, base * 0.95, false, false, pal);
+                            inline(ui, cell, base * 0.95, false, true, pal);
                         }
                         ui.end_row();
                     }
@@ -1027,6 +1043,22 @@ pub fn show_plain(ui: &mut egui::Ui, text: &str, zoom: f32, dark: bool) {
             .size(BASE_FONT * 0.95 * zoom)
             .color(pal.text),
     );
+}
+
+/// Widest a single table column may become.
+///
+/// An equal share of the room left after the gaps between columns. A
+/// ceiling, not a fixed width: a grid still sizes each column to its
+/// content, so only a column that wants more than its share is made to
+/// wrap. The floor keeps a table of many columns in a narrow window
+/// from collapsing to slivers -- it will overflow instead, which is at
+/// least legible.
+///
+/// Split out from the view so the arithmetic can be checked without a
+/// window.
+fn table_column_cap(available: f32, cols: usize, gap: f32) -> f32 {
+    let cols = cols.max(1) as f32;
+    ((available - gap * (cols - 1.0)) / cols).max(48.0)
 }
 
 /// The width the reading column should take inside `available`.
@@ -1417,6 +1449,36 @@ mod tests {
     /// The bug this pins: at a large enough zoom the old rule returned a
     /// column wider than the window, so the text ran flush to both edges
     /// and was clipped on the right.
+    /// The bug this pins: table cells did not wrap, so a documentation
+    /// table of whole sentences asked for a column wider than the
+    /// window -- and because the reading column is measured from the
+    /// room available, that one table widened every paragraph with it.
+    #[test]
+    fn a_table_column_never_claims_more_than_its_share() {
+        let gap = 16.0;
+        for cols in 1..=8 {
+            let cap = table_column_cap(900.0, cols, gap);
+            let total = cap * cols as f32 + gap * (cols as f32 - 1.0);
+            assert!(
+                total <= 900.5,
+                "{cols} columns of {cap} plus gaps comes to {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_column_gets_the_whole_width() {
+        assert_eq!(table_column_cap(900.0, 1, 16.0), 900.0);
+    }
+
+    /// Slivers are not legible. A table too wide for the window is.
+    #[test]
+    fn a_narrow_window_stops_dividing_rather_than_producing_slivers() {
+        assert_eq!(table_column_cap(200.0, 12, 16.0), 48.0);
+        // And a nonsense column count cannot divide by zero.
+        assert!(table_column_cap(900.0, 0, 16.0).is_finite());
+    }
+
     #[test]
     fn the_column_always_leaves_a_margin_inside_the_window() {
         for available in [400.0, 1000.0, 2000.0, 4000.0] {

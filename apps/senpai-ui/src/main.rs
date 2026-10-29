@@ -1455,9 +1455,17 @@ impl SenpaiApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg))
             .show(ctx, |ui| {
+                // Measured out here, on the panel, and not inside the
+                // scroll area. Inside, `available_width` is the width of
+                // the *content*, which egui grows to fit whatever is in
+                // it -- so one item too wide for the column widened the
+                // column, which widened the paragraphs, which pushed the
+                // text off the window. The panel is the window, and the
+                // window is what the column should answer to.
+                let viewport = ui.available_width();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let width = markdown::column_width(ui.available_width());
-                    let gutter = ((ui.available_width() - width) / 2.0).max(0.0);
+                    let width = markdown::column_width(viewport);
+                    let gutter = ((viewport - width) / 2.0).max(0.0);
                     ui.horizontal_top(|ui| {
                         // Zeroed, or egui inserts its default item gap
                         // between the spacer and the column and pushes
