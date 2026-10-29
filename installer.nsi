@@ -1,5 +1,5 @@
 !define APP_NAME "SENPAI"
-!define APP_VERSION "0.2.4"
+!define APP_VERSION "0.2.5"
 !define INSTALL_DIR "$PROGRAMFILES64\SENPAI"
 
 # Source of the files to install. Defaults to the staging directory that
