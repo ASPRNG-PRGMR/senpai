@@ -1695,7 +1695,12 @@ impl SenpaiApp {
 
     fn menu_button(&mut self, ui: &mut egui::Ui, label: &str, kind: Menu) {
         let selected = self.open_menu == Some(kind);
-        if Pill::new(label).selected(selected).show(ui).clicked() {
+        if Pill::new(label)
+            .selected(selected)
+            .lead()
+            .show(ui)
+            .clicked()
+        {
             if selected {
                 self.close_menu();
             } else {

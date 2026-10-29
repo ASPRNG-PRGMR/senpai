@@ -328,6 +328,7 @@ pub struct Pill<'a> {
     min_width: f32,
     font_size: f32,
     align_left: bool,
+    lead: bool,
 }
 
 impl<'a> Pill<'a> {
@@ -339,6 +340,7 @@ impl<'a> Pill<'a> {
             min_width: 0.0,
             font_size: BAR_FONT,
             align_left: false,
+            lead: false,
         }
     }
 
@@ -370,6 +372,19 @@ impl<'a> Pill<'a> {
 
     pub fn small(mut self) -> Self {
         self.font_size = 12.0;
+        self
+    }
+
+    /// Carries the full text colour at rest rather than the dimmed one.
+    ///
+    /// For a label that is the main thing on its surface -- the top
+    /// bar's menu buttons -- rather than one entry among many, where
+    /// dimming at rest is what stops a long list shouting. Without it a
+    /// bar button sat at `text_dim`, which in Light mode is a mid grey
+    /// on white: legible, but reading as disabled rather than as the
+    /// primary way around the application.
+    pub fn lead(mut self) -> Self {
+        self.lead = true;
         self
     }
 
@@ -427,15 +442,16 @@ impl<'a> Pill<'a> {
         let rect = rect.shrink(press * 1.5);
         let rounding = Rounding::same(R_PILL);
 
+        let rest_text = if self.lead { text() } else { text_dim() };
         let (fill, text_col, lift) = match self.style {
             PillStyle::Ghost => (
                 Color32::TRANSPARENT.lerp_to_gamma(surface_hover(), hover),
-                text_dim().lerp_to_gamma(text(), hover),
+                rest_text.lerp_to_gamma(text(), hover),
                 0.0,
             ),
             PillStyle::Quiet => (
                 veil(16).lerp_to_gamma(surface_hover(), hover),
-                text_dim().lerp_to_gamma(text(), hover),
+                rest_text.lerp_to_gamma(text(), hover),
                 0.0,
             ),
             PillStyle::Selected => (
@@ -762,14 +778,18 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
 /// The slot is sized by the caller on the widest text the counter will
 /// ever hold rather than on what it holds now, so the number does not
 /// shuffle sideways on the turn from page 9 to page 10.
-pub fn counter_label(ui: &mut egui::Ui, text: &str, slot_w: f32) {
+pub fn counter_label(ui: &mut egui::Ui, label: &str, slot_w: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(slot_w, PILL_HEIGHT), Sense::hover());
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
-        text,
+        label,
         egui::FontId::proportional(COUNTER_FONT),
-        text_dim(),
+        // Full strength, like the buttons beside it. The page you are on
+        // is something you read off the bar, not a hint about it; the
+        // zoom next to it stays dimmed, being the one thing there that
+        // genuinely is an aside.
+        text(),
     );
 }
 
