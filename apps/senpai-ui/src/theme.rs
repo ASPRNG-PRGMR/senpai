@@ -648,70 +648,61 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
 
 // ── Page counter ─────────────────────────────────────────────────────────
 
-/// The page counter, drawn at one fixed position whether it is sitting
-/// alone at the top of the window or inside the top bar.
+/// The counter as it appears inside the top bar: the glyphs alone, in a
+/// slot the bar has made room for.
 ///
-/// The number never moves. Only what is behind it changes: with the bar
-/// hidden it gets a capsule of its own, and when the bar comes up that
-/// capsule dissolves while the bar's own surface takes its place under
-/// the same glyphs. Two separate widgets swapping over would have to be
-/// aligned by hand and would drift the moment either one's padding
-/// changed, so there is one widget and two backgrounds.
+/// The slot is sized by the caller on the widest text the counter will
+/// ever hold rather than on what it holds now, so the number does not
+/// shuffle sideways on the turn from page 9 to page 10.
+pub fn counter_label(ui: &mut egui::Ui, text: &str, slot_w: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(slot_w, PILL_HEIGHT), Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(COUNTER_FONT),
+        TEXT_DIM,
+    );
+}
+
+/// The counter as it appears on its own, with the bar hidden: a capsule
+/// centred at the top of the window.
 ///
-/// `center_x` is where the bar reserved room for it, so the glyphs land
-/// in the same place whichever surface is behind them. The vertical
-/// geometry is the bar's own: `top_y` is the bar's offset from the top
-/// of the window, the 7px margin is the bar's margin, and the content
-/// box is exactly [`PILL_HEIGHT`], which is what the bar's buttons stand
-/// at. The capsule is therefore the bar's height by construction rather
-/// than by a pair of constants that happen to agree.
+/// Centred rather than standing where the bar's own counter stands. The
+/// two are different things -- one is a readout on a bar full of
+/// controls, the other is the only thing on screen -- and the lone one
+/// belongs in the middle, where nothing else is competing for the eye.
 ///
-/// Painted above `Order::Foreground` rather than on it. egui raises a
-/// layer to the top when it is clicked, so sharing an order with the bar
-/// meant that opening a menu once could leave the bar permanently above
-/// the number -- which reads as the counter simply not being there.
-pub fn page_counter(
-    ctx: &egui::Context,
-    center_x: f32,
-    top_y: f32,
-    text: &str,
-    text_t: f32,
-    frame_t: f32,
-) {
-    if text_t <= 0.001 {
+/// Its height is the bar's by construction: the same 7px margin around a
+/// content box of exactly [`PILL_HEIGHT`], which is what the bar's own
+/// buttons stand at.
+///
+/// Painted above `Order::Foreground`, because egui raises a layer to the
+/// top when it is clicked and sharing an order with the bar meant a
+/// single click on a menu could leave the bar permanently in front.
+pub fn page_capsule(ctx: &egui::Context, offset_y: f32, text: &str, t: f32) {
+    if t <= 0.001 {
         return;
     }
-    let font = egui::FontId::proportional(COUNTER_FONT);
-    let text_w = ctx
-        .fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE))
-        .size()
-        .x;
-    egui::Area::new(egui::Id::new("page_counter"))
-        .fixed_pos(pos2(center_x - (text_w + 28.0) / 2.0, top_y))
+    egui::Area::new(egui::Id::new("page_capsule"))
+        .anchor(Align2::CENTER_TOP, vec2(0.0, offset_y))
         .order(egui::Order::Tooltip)
         // Never takes a click: it is a readout, and swallowing presses
-        // here would punch a hole in the bar it sits on.
+        // would punch a hole in the middle of the page.
         .interactable(false)
         .show(ctx, |ui| {
-            egui::Frame::none()
-                .fill(CHROME.gamma_multiply(frame_t))
-                .rounding(Rounding::same(R_PILL))
-                .stroke(Stroke::new(1.0_f32, HAIRLINE.gamma_multiply(frame_t)))
-                .shadow(soft_shadow(frame_t))
+            ui.set_opacity(t);
+            chrome_frame(R_PILL)
                 .inner_margin(egui::Margin::symmetric(14.0, 7.0))
                 .show(ui, |ui| {
-                    // Sized to the text, so a four-digit page count gets
-                    // the room it needs and a single-digit one does not
-                    // leave a gap. One line either side of the slash.
-                    let (rect, _) =
-                        ui.allocate_exact_size(vec2(text_w, PILL_HEIGHT), Sense::hover());
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        text,
-                        font,
-                        TEXT_DIM.gamma_multiply(text_t),
-                    );
+                    let font = egui::FontId::proportional(COUNTER_FONT);
+                    // Sized to the text: a four-digit count gets the room
+                    // it needs and a single-digit one leaves no gap.
+                    let width = ui
+                        .fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE))
+                        .size()
+                        .x;
+                    counter_label(ui, text, width);
                 });
         });
 }

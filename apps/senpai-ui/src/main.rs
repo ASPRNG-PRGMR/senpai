@@ -534,10 +534,6 @@ struct SenpaiApp {
     render_started: Option<f64>,
     /// Page the counter last reported, so a turn can be noticed.
     last_shown_page: usize,
-    /// Where in the bar the counter's slot was reserved this frame. The
-    /// capsule stands in the same place, so the number does not move
-    /// when the bar arrives around it.
-    page_slot_x: f32,
     /// When the lone capsule should stop being shown. Only meaningful
     /// while the bar is hidden; with the bar up the number is in it.
     page_flash_until: f64,
@@ -619,7 +615,6 @@ impl SenpaiApp {
             render_started: None,
             last_shown_page: 0,
             page_flash_until: 0.0,
-            page_slot_x: 0.0,
         };
         configure_context(&cc.egui_ctx);
         theme::install(&cc.egui_ctx, app.dark_mode);
@@ -1303,19 +1298,24 @@ impl SenpaiApp {
     /// one number a reader checks constantly in the corner nothing else
     /// lives in, so it moved up here, where the controls already are.
     ///
-    /// Which of its two forms it takes depends on the bar, and on
-    /// whether anything just happened:
+    /// This is the lone capsule only. With the bar up the number is
+    /// drawn by the bar itself, at its right-hand end -- see
+    /// `show_top_bar`.
     ///
-    /// - bar up: part of the bar, always. The bar is already on screen,
-    ///   and a readout costs nothing once it is;
-    /// - bar hidden, a page just turned: a capsule of its own, which
+    /// Three states between them:
+    ///
+    /// - bar up: part of the bar. The bar is already on screen, and a
+    ///   readout costs nothing once it is;
+    /// - bar hidden, a page just turned: this capsule, centred, which
     ///   leaves again after [`PAGE_FLASH`];
     /// - bar hidden, nothing happening: nothing at all. Someone reading
     ///   a page should be looking at the page, not at a number that has
     ///   not changed since they last looked.
     ///
-    /// Hovering the top swaps the capsule for the bar with the number
-    /// unmoved: the backgrounds cross-fade, the glyphs do not.
+    /// Centred rather than standing where the bar's counter stands. The
+    /// two are different things: one is a readout among controls, the
+    /// other is the only thing on screen, and the only thing on screen
+    /// belongs in the middle of it.
     fn show_page_counter(&mut self, ctx: &egui::Context, bar_t: f32) {
         if self.page_count == 0 {
             return;
@@ -1340,20 +1340,14 @@ impl SenpaiApp {
             bar_t <= 0.001 && flashing,
             PAGE_PILL_FADE,
         );
-        let text_t = bar_t.max(alone_t);
-        // The capsule is held back while the bar has any presence at
-        // all, so the two surfaces are never both solid at once.
-        let frame_t = alone_t * (1.0 - bar_t);
-        // Tracks the bar's own travel, so during a transition the number
-        // moves with the surface arriving under it.
-        let slide = 2.0 + 10.0 * egui::emath::easing::cubic_out(text_t);
-        theme::page_counter(
+        // The same arrival the bar makes: tucked up against the edge at
+        // 2, settling at 12.
+        let slide = 2.0 + 10.0 * egui::emath::easing::cubic_out(alone_t);
+        theme::page_capsule(
             ctx,
-            self.page_slot_x,
             slide,
             &format!("{} / {}", self.current_page + 1, self.page_count),
-            text_t,
-            frame_t,
+            alone_t,
         );
     }
 
@@ -1583,18 +1577,15 @@ impl SenpaiApp {
     /// The top bar. `fade` is 0..1 from the caller's animation, so the bar
     /// can slide/fade in and out instead of popping on hover.
     fn show_top_bar(&mut self, ctx: &egui::Context, fade: f32) {
-        // A hidden bar is laid out all the same, at zero opacity and
-        // taking no input. It has to be: the page capsule stands exactly
-        // where the bar's own counter stands, and the only way to know
-        // where that is without reimplementing the bar's arithmetic in a
-        // second place is to let the bar work it out. Laying out a
-        // handful of widgets costs nothing; the clicks are what matter,
-        // and `interactable` is what stops an invisible bar eating them.
-        let hidden = fade <= 0.001;
-        if hidden {
+        if fade <= 0.001 {
+            // Fully hidden: don't paint, and crucially don't register the
+            // bar's click targets, or an invisible bar would still eat
+            // clicks meant for the page.
             self.close_menu();
             self.menu_painting = None;
+            self.bar_rect = egui::Rect::NOTHING;
             self.menu_rect = egui::Rect::NOTHING;
+            return;
         }
 
         let screen_width = ctx.screen_rect().width();
@@ -1609,7 +1600,6 @@ impl SenpaiApp {
         let bar = egui::Area::new(egui::Id::new("top_bar"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, slide))
             .order(egui::Order::Foreground)
-            .interactable(!hidden)
             .show(ctx, |ui| {
                 ui.set_opacity(fade);
                 ui.set_width(bar_width);
@@ -1646,35 +1636,22 @@ impl SenpaiApp {
                                     }
                                     if self.page_count > 0 {
                                         ui.add_space(14.0);
-                                        // A blank slot, not the number:
-                                        // the number is painted once, by
-                                        // `show_page_counter`, over
-                                        // whichever surface is there to
-                                        // receive it. Reserving the room
-                                        // here is what keeps the two in
-                                        // the same place.
-                                        let (slot, _) = ui.allocate_exact_size(
-                                            egui::vec2(
-                                                page_counter_width(ctx, self.page_count),
-                                                theme::PILL_HEIGHT,
+                                        theme::counter_label(
+                                            ui,
+                                            &format!(
+                                                "{} / {}",
+                                                self.current_page + 1,
+                                                self.page_count
                                             ),
-                                            egui::Sense::hover(),
+                                            page_counter_width(ctx, self.page_count),
                                         );
-                                        self.page_slot_x = slot.center().x;
                                     }
                                 },
                             );
                         });
                     });
             });
-        self.bar_rect = if hidden {
-            egui::Rect::NOTHING
-        } else {
-            bar.response.rect
-        };
-        if hidden {
-            return;
-        }
+        self.bar_rect = bar.response.rect;
 
         // Painted from `menu_painting`, not `open_menu`, so closing
         // animates symmetrically with opening instead of cutting out.
