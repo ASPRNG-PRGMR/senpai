@@ -27,7 +27,7 @@
 //! the parser a flat state machine instead of a recursive one.
 
 use eframe::egui;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::theme;
 
@@ -62,6 +62,42 @@ pub enum Marker {
     Number(u64),
 }
 
+/// A GitHub alert: `> [!NOTE]` and its four siblings.
+///
+/// Carried on every block inside the quote rather than only on the one
+/// that opened it, because the colour has to apply to all of them and
+/// the flattened block list has no other way to say "still inside".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alert {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl Alert {
+    fn from_kind(kind: BlockQuoteKind) -> Self {
+        match kind {
+            BlockQuoteKind::Note => Self::Note,
+            BlockQuoteKind::Tip => Self::Tip,
+            BlockQuoteKind::Important => Self::Important,
+            BlockQuoteKind::Warning => Self::Warning,
+            BlockQuoteKind::Caution => Self::Caution,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Note => "NOTE",
+            Self::Tip => "TIP",
+            Self::Important => "IMPORTANT",
+            Self::Warning => "WARNING",
+            Self::Caution => "CAUTION",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BlockKind {
     Heading {
@@ -81,6 +117,17 @@ pub enum BlockKind {
         head: Vec<Vec<Span>>,
         rows: Vec<Vec<Vec<Span>>>,
     },
+    /// The term being defined in a definition list. Its definitions
+    /// follow as ordinary blocks one indent level in.
+    DefinitionTitle(Vec<Span>),
+    /// A footnote's text, where the parser puts it -- at the foot of the
+    /// document. Laid out like a list item, with the label hanging.
+    Footnote {
+        label: String,
+        spans: Vec<Span>,
+    },
+    /// The heading of a GitHub alert, emitted where the quote opens.
+    AlertLabel(Alert),
     Rule,
 }
 
@@ -91,6 +138,8 @@ pub struct Block {
     pub indent: u8,
     /// How many block quotes deep. 0 for a block outside any quote.
     pub quote: u8,
+    /// The innermost alert this block sits inside, if any.
+    pub alert: Option<Alert>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -101,8 +150,13 @@ pub struct Document {
     pub blocks: Vec<Block>,
 }
 
-/// Parses CommonMark, plus the three extensions that are near-universal
-/// in real documents: tables, strikethrough and task lists.
+/// Parses CommonMark plus the extensions that turn up in real documents.
+///
+/// The metadata-block options are the ones that matter most for not
+/// looking broken. Without them the closing `---` of a YAML front matter
+/// block is read as a setext underline, which turns the whole header
+/// into a level-2 heading -- so every Obsidian, Hugo or Jekyll note
+/// opened with its own metadata as the largest text on the page.
 ///
 /// Raw HTML is dropped rather than shown as source. A reader that prints
 /// `<div class="x">` at the user is not reading the document to them, and
@@ -113,6 +167,12 @@ pub fn parse(src: &str) -> Document {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_DEFINITION_LIST);
+    // GFM here means exactly one thing: the `> [!NOTE]` alert tags.
+    options.insert(Options::ENABLE_GFM);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
 
     let mut b = Builder::default();
     for event in Parser::new_ext(src, options) {
@@ -128,6 +188,10 @@ enum Target {
     Heading(u8),
     Item(Marker),
     Cell,
+    /// The term of a definition list entry.
+    Definition,
+    /// A footnote's first paragraph, which carries its label.
+    Footnote(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +216,19 @@ struct Builder {
     style: Span,
     lists: Vec<ListLevel>,
     quote: u8,
+    /// One entry per open block quote, holding its alert tag if it had
+    /// one. Kept beside `quote` rather than folded into it because only
+    /// the innermost tag decides the colour.
+    alerts: Vec<Option<Alert>>,
+    /// Indentation owed to containers that are not lists: a definition
+    /// list's definitions, and a footnote's continuation paragraphs.
+    extra_indent: u8,
+    /// Inside a YAML or `+++` front matter block, whose contents are
+    /// metadata about the document rather than part of it.
+    metadata: bool,
+    /// Set between the start of a footnote and its first paragraph, for
+    /// the same reason as `item_fresh`.
+    footnote_fresh: bool,
     /// Set between `Start(Item)` and the item's first paragraph, so a
     /// loose list -- where the item's text arrives wrapped in a paragraph
     /// -- does not emit an empty item followed by a stray paragraph.
@@ -170,7 +247,9 @@ impl Builder {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
-                if self.image > 0 {
+                if self.metadata {
+                    // Front matter is about the document, not in it.
+                } else if self.image > 0 {
                     self.image_alt.push_str(&t);
                 } else if let Some((_, text)) = &mut self.code {
                     text.push_str(&t);
@@ -203,10 +282,11 @@ impl Builder {
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => {
-                if self.item_fresh {
-                    // Keep the item as the target: this paragraph *is*
-                    // the item's text.
+                if self.item_fresh || self.footnote_fresh {
+                    // Keep the item (or footnote) as the target: this
+                    // paragraph *is* its text.
                     self.item_fresh = false;
+                    self.footnote_fresh = false;
                 } else if self.table.is_none() {
                     self.target = Some(Target::Paragraph);
                 }
@@ -215,9 +295,16 @@ impl Builder {
                 self.flush();
                 self.target = Some(Target::Heading(level as u8));
             }
-            Tag::BlockQuote(_) => {
+            Tag::BlockQuote(kind) => {
                 self.flush();
                 self.quote = self.quote.saturating_add(1);
+                let alert = kind.map(Alert::from_kind);
+                self.alerts.push(alert);
+                // Emitted after the depth has gone up, so the label sits
+                // inside the quote it names.
+                if let Some(alert) = alert {
+                    self.block(BlockKind::AlertLabel(alert));
+                }
             }
             Tag::CodeBlock(kind) => {
                 self.flush();
@@ -269,6 +356,21 @@ impl Builder {
             Tag::Strikethrough => self.style.strike = true,
             Tag::Link { dest_url, .. } => self.style.link = Some(dest_url.to_string()),
             Tag::Image { .. } => self.image = self.image.saturating_add(1),
+            Tag::MetadataBlock(_) => self.metadata = true,
+            Tag::DefinitionListTitle => {
+                self.flush();
+                self.target = Some(Target::Definition);
+            }
+            Tag::DefinitionListDefinition => {
+                self.flush();
+                self.extra_indent = self.extra_indent.saturating_add(1);
+            }
+            Tag::FootnoteDefinition(label) => {
+                self.flush();
+                self.target = Some(Target::Footnote(label.to_string()));
+                self.footnote_fresh = true;
+                self.extra_indent = self.extra_indent.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -276,7 +378,11 @@ impl Builder {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) => self.flush(),
-            TagEnd::BlockQuote(_) => self.quote = self.quote.saturating_sub(1),
+            TagEnd::BlockQuote(_) => {
+                self.flush();
+                self.quote = self.quote.saturating_sub(1);
+                self.alerts.pop();
+            }
             TagEnd::CodeBlock => {
                 if let Some((lang, text)) = self.code.take() {
                     let text = text.strip_suffix('\n').unwrap_or(&text).to_owned();
@@ -293,7 +399,7 @@ impl Builder {
                 self.item_fresh = false;
             }
             TagEnd::TableCell => {
-                let cell = std::mem::take(&mut self.spans);
+                let cell = linkify(std::mem::take(&mut self.spans));
                 self.target = None;
                 if let Some(t) = &mut self.table {
                     t.row.push(cell);
@@ -322,6 +428,17 @@ impl Builder {
             TagEnd::Strong => self.style.strong = false,
             TagEnd::Strikethrough => self.style.strike = false,
             TagEnd::Link => self.style.link = None,
+            TagEnd::MetadataBlock(_) => self.metadata = false,
+            TagEnd::DefinitionListTitle => self.flush(),
+            TagEnd::DefinitionListDefinition => {
+                self.flush();
+                self.extra_indent = self.extra_indent.saturating_sub(1);
+            }
+            TagEnd::FootnoteDefinition => {
+                self.flush();
+                self.footnote_fresh = false;
+                self.extra_indent = self.extra_indent.saturating_sub(1);
+            }
             TagEnd::Image => {
                 self.image = self.image.saturating_sub(1);
                 if self.image == 0 {
@@ -363,16 +480,18 @@ impl Builder {
         let Some(target) = self.target.take() else {
             return;
         };
-        let spans = std::mem::take(&mut self.spans);
-        // An empty paragraph is noise; an empty list item is a real,
-        // visible thing (a bullet with nothing after it).
-        if spans.is_empty() && !matches!(target, Target::Item(_)) {
+        let spans = linkify(std::mem::take(&mut self.spans));
+        // An empty paragraph is noise; an empty list item or footnote is
+        // a real, visible thing (a marker with nothing after it).
+        if spans.is_empty() && !matches!(target, Target::Item(_) | Target::Footnote(_)) {
             return;
         }
         let kind = match target {
             Target::Paragraph => BlockKind::Paragraph(spans),
             Target::Heading(level) => BlockKind::Heading { level, spans },
             Target::Item(marker) => BlockKind::ListItem { marker, spans },
+            Target::Definition => BlockKind::DefinitionTitle(spans),
+            Target::Footnote(label) => BlockKind::Footnote { label, spans },
             // A cell is drained by TagEnd::TableCell and never reaches here.
             Target::Cell => return,
         };
@@ -380,16 +499,19 @@ impl Builder {
     }
 
     fn block(&mut self, kind: BlockKind) {
-        // A list item's own depth is the list it belongs to, not the one
-        // below it: `lists.len()` counts the enclosing list too.
+        let base = self.lists.len() + self.extra_indent as usize;
+        // A marker sits at the level of the container it opens, not
+        // inside it: `lists.len()` counts the enclosing list, and
+        // `extra_indent` counts the footnote's own body.
         let indent = match kind {
-            BlockKind::ListItem { .. } => self.lists.len().saturating_sub(1),
-            _ => self.lists.len(),
+            BlockKind::ListItem { .. } | BlockKind::Footnote { .. } => base.saturating_sub(1),
+            _ => base,
         };
         self.blocks.push(Block {
             kind,
             indent: indent.min(u8::MAX as usize) as u8,
             quote: self.quote,
+            alert: self.alerts.iter().rev().flatten().next().copied(),
         });
     }
 
@@ -404,6 +526,106 @@ impl Builder {
             blocks: self.blocks,
         }
     }
+}
+
+/// Turns bare `http://` and `https://` URLs in plain text into links.
+///
+/// pulldown-cmark does not do this for us: GFM's autolink literals are
+/// not part of what its `ENABLE_GFM` covers, which is only the alert
+/// tags. In a reader an address that cannot be clicked is an address
+/// that has to be retyped, so the scan earns its thirty lines.
+///
+/// Deliberately narrow. Only the two schemes, only in runs that are not
+/// already a link and not code, and only at a word boundary -- so
+/// `xhttp://x` is left alone. Trailing punctuation is handed back to the
+/// sentence, because `(see https://example.com).` ends in a bracket and
+/// a full stop that are not part of the address.
+fn linkify(spans: Vec<Span>) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.link.is_some() || span.code {
+            out.push(span);
+            continue;
+        }
+        let text = span.text.clone();
+        let mut rest = 0usize;
+        while let Some(found) = find_scheme(&text[rest..]) {
+            let start = rest + found;
+            let end = url_end(&text, start);
+            // Nothing after the scheme is not an address.
+            if text[start..end].ends_with("//") {
+                rest = start + 4;
+                continue;
+            }
+            if start > rest {
+                out.push(Span {
+                    text: text[rest..start].to_owned(),
+                    ..span.clone()
+                });
+            }
+            let url = text[start..end].to_owned();
+            out.push(Span {
+                text: url.clone(),
+                link: Some(url),
+                ..span.clone()
+            });
+            rest = end;
+        }
+        if rest < text.len() {
+            out.push(Span {
+                text: text[rest..].to_owned(),
+                ..span
+            });
+        }
+    }
+    out
+}
+
+/// Byte offset of the next `http://` or `https://` that starts a word.
+fn find_scheme(hay: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = hay[from..].find("http") {
+        let at = from + i;
+        let tail = &hay[at..];
+        let boundary = hay[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if boundary && (tail.starts_with("http://") || tail.starts_with("https://")) {
+            return Some(at);
+        }
+        from = at + 4;
+    }
+    None
+}
+
+/// Where the URL beginning at `start` ends: at whitespace or a delimiter
+/// that cannot appear in one, then backing off any trailing punctuation
+/// that belongs to the surrounding sentence.
+fn url_end(text: &str, start: usize) -> usize {
+    let mut end = text[start..]
+        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
+        .map_or(text.len(), |i| start + i);
+    loop {
+        let slice = &text[start..end];
+        let Some(last) = slice.chars().next_back() else {
+            break;
+        };
+        let give_back = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+            // A closing bracket is part of the address only if the
+            // address opened one -- Wikipedia URLs do.
+            ')' => slice.matches('(').count() < slice.matches(')').count(),
+            ']' => slice.matches('[').count() < slice.matches(']').count(),
+            '}' => slice.matches('{').count() < slice.matches('}').count(),
+            _ => false,
+        };
+        if !give_back {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    end
 }
 
 /// The text of a run of spans with all styling dropped.
@@ -436,6 +658,23 @@ struct Palette {
     link: egui::Color32,
     code_bg: egui::Color32,
     rule: egui::Color32,
+    dark: bool,
+}
+
+impl Palette {
+    /// Alert colours, kept deliberately close to GitHub's so a document
+    /// written against them reads the way its author saw it.
+    fn alert(&self, alert: Alert) -> egui::Color32 {
+        let (dark_rgb, light_rgb) = match alert {
+            Alert::Note => ((88, 166, 255), (9, 105, 218)),
+            Alert::Tip => ((63, 185, 80), (26, 127, 55)),
+            Alert::Important => ((163, 113, 247), (130, 80, 223)),
+            Alert::Warning => ((210, 153, 34), (154, 103, 0)),
+            Alert::Caution => ((248, 81, 73), (207, 34, 46)),
+        };
+        let (r, g, b) = if self.dark { dark_rgb } else { light_rgb };
+        egui::Color32::from_rgb(r, g, b)
+    }
 }
 
 fn palette(dark: bool) -> Palette {
@@ -447,6 +686,7 @@ fn palette(dark: bool) -> Palette {
             link: theme::ACCENT,
             code_bg: egui::Color32::from_gray(46),
             rule: egui::Color32::from_gray(64),
+            dark: true,
         }
     } else {
         Palette {
@@ -456,6 +696,7 @@ fn palette(dark: bool) -> Palette {
             link: egui::Color32::from_rgb(28, 100, 190),
             code_bg: egui::Color32::from_gray(222),
             rule: egui::Color32::from_gray(196),
+            dark: false,
         }
     }
 }
@@ -481,8 +722,14 @@ pub fn show(ui: &mut egui::Ui, doc: &Document, zoom: f32, dark: bool) {
     // object.
     ui.spacing_mut().item_spacing.y = 0.0;
 
+    // How deep in quotes the block above sat, so a bar can be carried
+    // across the gap between two blocks of the same quote.
+    let mut prev_quote = 0u8;
+    let mut prev_alert: Option<Alert> = None;
+
     for (i, block) in doc.blocks.iter().enumerate() {
-        ui.add_space(space_before(block, i == 0) * zoom);
+        let gap = space_before(block, i == 0) * zoom;
+        ui.add_space(gap);
 
         let indent = (block.indent as f32 * 20.0 + block.quote as f32 * 16.0) * zoom;
         let laid_out = ui.horizontal_top(|ui| {
@@ -497,14 +744,34 @@ pub fn show(ui: &mut egui::Ui, doc: &Document, zoom: f32, dark: bool) {
 
         // Painted after the fact because the bar has to span the block's
         // full height, which is only known once it has been laid out.
+        // An alert's bar is its own colour, which is most of what makes
+        // a NOTE read differently from a WARNING at a glance.
+        let bar = match block.alert {
+            Some(alert) => pal.alert(alert),
+            None => pal.faint.gamma_multiply(0.7),
+        };
+        let rect = laid_out.response.rect;
         for depth in 0..block.quote {
-            let x = laid_out.response.rect.left() + (depth as f32 * 16.0 + 3.0) * zoom;
+            let x = rect.left() + (depth as f32 * 16.0 + 3.0) * zoom;
+            // Each block paints only its own height, so without bridging
+            // the leading gap an alert's bar came out as dashes -- one
+            // stroke beside the label, another beside the body.
+            // Two alerts back to back are two quotes, not one: without
+            // the alert comparison their bars join into a single rail
+            // that only changes colour.
+            let top = if prev_quote > depth && prev_alert == block.alert {
+                rect.top() - gap
+            } else {
+                rect.top()
+            };
             ui.painter().vline(
                 x,
-                laid_out.response.rect.y_range(),
-                egui::Stroke::new(2.0_f32 * zoom, pal.faint.gamma_multiply(0.7)),
+                egui::Rangef::new(top, rect.bottom()),
+                egui::Stroke::new(2.0_f32 * zoom, bar),
             );
         }
+        prev_quote = block.quote;
+        prev_alert = block.alert;
     }
 }
 
@@ -521,32 +788,36 @@ fn body(ui: &mut egui::Ui, block: &Block, base: f32, zoom: f32, pal: &Palette) {
         }
         BlockKind::Paragraph(spans) => inline(ui, spans, base, false, true, pal),
         BlockKind::ListItem { marker, spans } => {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 7.0 * zoom;
-                let label = match marker {
-                    Marker::Bullet => "\u{2022}".to_owned(),
-                    Marker::Number(n) => format!("{n}."),
-                };
-                // Painted into an exactly-sized box rather than added as
-                // a widget: a label gets centred in whatever box it is
-                // given, which left bullets floating above the text they
-                // belong to. Anchoring to the box's top edge at the body
-                // size puts the marker on the first line's baseline, and
-                // right-aligning keeps multi-digit numbers lined up.
-                let (slot, _) = ui
-                    .allocate_exact_size(egui::vec2(18.0 * zoom, base * 1.3), egui::Sense::hover());
-                ui.painter().text(
-                    slot.right_top(),
-                    egui::Align2::RIGHT_TOP,
-                    label,
-                    egui::FontId::proportional(base),
-                    pal.faint,
-                );
-                ui.vertical(|ui| {
-                    ui.set_width(ui.available_width());
-                    inline(ui, spans, base, false, true, pal);
-                });
-            });
+            let label = match marker {
+                Marker::Bullet => "\u{2022}".to_owned(),
+                Marker::Number(n) => format!("{n}."),
+            };
+            hanging(ui, &label, pal.faint, 18.0 * zoom, spans, base, zoom, pal);
+        }
+        BlockKind::Footnote { label, spans } => {
+            let label = format!("[{label}]");
+            // Sized to the label rather than to a fixed slot: footnote
+            // names are words as often as they are digits.
+            let width = ui
+                .fonts(|f| {
+                    f.layout_no_wrap(
+                        label.clone(),
+                        egui::FontId::proportional(base * 0.85),
+                        egui::Color32::WHITE,
+                    )
+                })
+                .size()
+                .x;
+            hanging(ui, &label, pal.faint, width, spans, base * 0.85, zoom, pal);
+        }
+        BlockKind::DefinitionTitle(spans) => inline(ui, spans, base, true, true, pal),
+        BlockKind::AlertLabel(alert) => {
+            ui.label(
+                egui::RichText::new(alert.label())
+                    .size(base * 0.78)
+                    .strong()
+                    .color(pal.alert(*alert)),
+            );
         }
         BlockKind::Code { lang, text } => {
             egui::Frame::none()
@@ -592,6 +863,44 @@ fn body(ui: &mut egui::Ui, block: &Block, base: f32, zoom: f32, pal: &Palette) {
         }
         BlockKind::Rule => rule(ui, pal),
     }
+}
+
+/// A marker in its own column with the text hanging beside it, so a
+/// wrapped second line lines up under the first rather than under the
+/// marker. Shared by list items and footnotes.
+///
+/// The label is painted into an exactly-sized box rather than added as a
+/// widget: a label gets centred in whatever box it is given, which left
+/// bullets floating above the text they belonged to. Anchoring to the
+/// box's top edge at the body size puts the marker on the first line's
+/// baseline, and right-aligning keeps multi-digit numbers lined up.
+#[allow(clippy::too_many_arguments)]
+fn hanging(
+    ui: &mut egui::Ui,
+    label: &str,
+    label_col: egui::Color32,
+    slot_w: f32,
+    spans: &[Span],
+    base: f32,
+    zoom: f32,
+    pal: &Palette,
+) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 7.0 * zoom;
+        let (slot, _) =
+            ui.allocate_exact_size(egui::vec2(slot_w, base * 1.3), egui::Sense::hover());
+        ui.painter().text(
+            slot.right_top(),
+            egui::Align2::RIGHT_TOP,
+            label,
+            egui::FontId::proportional(base),
+            label_col,
+        );
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            inline(ui, spans, base, false, true, pal);
+        });
+    });
 }
 
 fn inline(ui: &mut egui::Ui, spans: &[Span], size: f32, bold_all: bool, wrap: bool, pal: &Palette) {
@@ -682,7 +991,11 @@ fn space_before(block: &Block, first: bool) -> f32 {
                 17.0
             }
         }
-        BlockKind::ListItem { .. } => 5.0,
+        BlockKind::ListItem { .. } | BlockKind::Footnote { .. } => 5.0,
+        // The label belongs to the quote it opens, so it sits against
+        // it rather than floating between two blocks.
+        BlockKind::AlertLabel(_) => 13.0,
+        BlockKind::DefinitionTitle(_) => 11.0,
         BlockKind::Code { .. } | BlockKind::Table { .. } => 13.0,
         BlockKind::Rule => 15.0,
         BlockKind::Paragraph(_) => 11.0,
@@ -705,15 +1018,21 @@ mod tests {
     }
 
     fn text_of(src: &str) -> Vec<String> {
-        parse(src)
-            .blocks
+        text_of_doc(&parse(src))
+    }
+
+    fn text_of_doc(doc: &Document) -> Vec<String> {
+        doc.blocks
             .iter()
-            .map(|b| match &b.kind {
+            .map(|b: &Block| match &b.kind {
                 BlockKind::Heading { spans, .. }
                 | BlockKind::Paragraph(spans)
-                | BlockKind::ListItem { spans, .. } => plain(spans),
+                | BlockKind::ListItem { spans, .. }
+                | BlockKind::DefinitionTitle(spans)
+                | BlockKind::Footnote { spans, .. } => plain(spans),
                 BlockKind::Code { text, .. } => text.clone(),
                 BlockKind::Table { .. } => "<table>".into(),
+                BlockKind::AlertLabel(a) => a.label().into(),
                 BlockKind::Rule => "---".into(),
             })
             .collect()
@@ -906,6 +1225,156 @@ mod tests {
     fn an_empty_document_parses_to_nothing_rather_than_failing() {
         assert!(parse("").blocks.is_empty());
         assert!(parse("\n\n   \n").blocks.is_empty());
+    }
+
+    /// The bug that prompted this round, and the one mdr hit as its
+    /// issue #56: CommonMark reads the closing `---` as a setext
+    /// underline, so the whole header became a level-2 heading and every
+    /// Obsidian or Hugo note opened with its metadata as the largest
+    /// text on the page.
+    #[test]
+    fn yaml_front_matter_is_not_part_of_the_document() {
+        let doc = parse("---\ntitle: My Notes\ntags: [a, b]\n---\n\n# Real heading\n\nBody.\n");
+        assert_eq!(text_of_doc(&doc), vec!["Real heading", "Body."]);
+        // And the heading after it is still the document's title.
+        assert_eq!(doc.title.as_deref(), Some("Real heading"));
+    }
+
+    #[test]
+    fn pluses_delimited_front_matter_is_dropped_too() {
+        // Hugo and Zola write TOML front matter this way.
+        let doc = parse("+++\ntitle = \"Notes\"\n+++\n\nBody.\n");
+        assert_eq!(text_of_doc(&doc), vec!["Body."]);
+    }
+
+    #[test]
+    fn front_matter_only_counts_at_the_very_top() {
+        // A rule in the body is still a rule, not the start of metadata.
+        let kinds = kinds("Body.\n\n---\n\nMore.\n");
+        assert!(matches!(kinds[1], BlockKind::Rule));
+    }
+
+    #[test]
+    fn github_alerts_colour_the_quote_they_open() {
+        let doc = parse("> [!WARNING]\n> Mind the gap.\n");
+        assert!(matches!(
+            doc.blocks[0].kind,
+            BlockKind::AlertLabel(Alert::Warning)
+        ));
+        // The tag applies to the body of the quote, not just its label.
+        assert_eq!(doc.blocks[1].alert, Some(Alert::Warning));
+        assert_eq!(doc.blocks[1].quote, 1);
+    }
+
+    #[test]
+    fn a_plain_quote_has_no_alert() {
+        let doc = parse("> just a quote\n");
+        assert_eq!(doc.blocks[0].alert, None);
+        assert_eq!(doc.blocks[0].quote, 1);
+    }
+
+    #[test]
+    fn every_alert_tag_is_recognised() {
+        for (tag, want) in [
+            ("NOTE", Alert::Note),
+            ("TIP", Alert::Tip),
+            ("IMPORTANT", Alert::Important),
+            ("WARNING", Alert::Warning),
+            ("CAUTION", Alert::Caution),
+        ] {
+            let doc = parse(&format!("> [!{tag}]\n> body\n"));
+            assert!(
+                matches!(doc.blocks[0].kind, BlockKind::AlertLabel(a) if a == want),
+                "{tag} should parse as {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footnote_definitions_land_as_their_own_blocks() {
+        let doc = parse("Text with a note.[^1]\n\n[^1]: The note itself.\n");
+        let note = doc
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Footnote { label, spans } => Some((label.clone(), plain(spans))),
+                _ => None,
+            })
+            .expect("a footnote definition");
+        assert_eq!(note, ("1".to_owned(), "The note itself.".to_owned()));
+        // The reference stays in the body so the reader can see there is one.
+        assert!(text_of_doc(&doc)[0].contains("[^1]"));
+    }
+
+    #[test]
+    fn definition_lists_separate_the_term_from_its_definition() {
+        let doc = parse("Term\n: The definition.\n");
+        let kinds: Vec<&BlockKind> = doc.blocks.iter().map(|b| &b.kind).collect();
+        assert!(matches!(kinds[0], BlockKind::DefinitionTitle(_)));
+        assert_eq!(
+            plain(match kinds[0] {
+                BlockKind::DefinitionTitle(s) => s,
+                _ => unreachable!(),
+            }),
+            "Term"
+        );
+        // The definition is indented under its term.
+        assert_eq!(doc.blocks[1].indent, 1);
+    }
+
+    #[test]
+    fn a_bare_url_becomes_a_link() {
+        let doc = parse("see https://example.com/x for more\n");
+        let BlockKind::Paragraph(spans) = &doc.blocks[0].kind else {
+            panic!("expected a paragraph");
+        };
+        let link = spans.iter().find(|s| s.link.is_some()).expect("a link");
+        assert_eq!(link.text, "https://example.com/x");
+        assert_eq!(link.link.as_deref(), Some("https://example.com/x"));
+        // The sentence around it survives intact.
+        assert_eq!(plain(spans), "see https://example.com/x for more");
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_the_address() {
+        for (src, want) in [
+            ("go to https://example.com.", "https://example.com"),
+            ("(see https://example.com)", "https://example.com"),
+            ("https://example.com, then", "https://example.com"),
+            // ...unless the address opened the bracket itself.
+            (
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            ),
+        ] {
+            let doc = parse(src);
+            let BlockKind::Paragraph(spans) = &doc.blocks[0].kind else {
+                panic!("expected a paragraph for {src:?}");
+            };
+            let link = spans
+                .iter()
+                .find(|s| s.link.is_some())
+                .unwrap_or_else(|| panic!("no link found in {src:?}"));
+            assert_eq!(link.text, want, "source: {src:?}");
+        }
+    }
+
+    #[test]
+    fn urls_are_left_alone_where_they_are_not_addresses() {
+        // Inside code.
+        let doc = parse("`https://example.com`\n");
+        let BlockKind::Paragraph(spans) = &doc.blocks[0].kind else {
+            panic!("expected a paragraph");
+        };
+        assert!(spans.iter().all(|s| s.link.is_none()));
+
+        // Mid-word, and an explicit link keeps its own destination.
+        let doc = parse("xhttps://example.com and [text](https://real.example)\n");
+        let BlockKind::Paragraph(spans) = &doc.blocks[0].kind else {
+            panic!("expected a paragraph");
+        };
+        let links: Vec<&str> = spans.iter().filter_map(|s| s.link.as_deref()).collect();
+        assert_eq!(links, vec!["https://real.example"]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ members = [
 , "apps/win-test"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "TBD"
 repository = "https://github.com/YOUR_ORG/senpai"
