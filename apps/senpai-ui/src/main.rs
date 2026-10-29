@@ -148,6 +148,24 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// How long the lone page capsule takes to leave. Shorter than the
 /// bar's own fade so it is out of the way before the bar is fully there.
 const PAGE_PILL_FADE: f32 = 0.09;
+/// Width to reserve for the page counter.
+///
+/// Measured on the widest text it will ever hold rather than on what it
+/// holds now: sized to the current number, the whole right-hand group
+/// would shift sideways on the turn from page 9 to page 10.
+fn page_counter_width(ctx: &egui::Context, page_count: usize) -> f32 {
+    let widest = format!("{page_count} / {page_count}");
+    ctx.fonts(|f| {
+        f.layout_no_wrap(
+            widest,
+            egui::FontId::proportional(theme::COUNTER_FONT),
+            egui::Color32::WHITE,
+        )
+    })
+    .size()
+    .x
+}
+
 /// Largest text file either text view will open. See `read_text`.
 const MAX_TEXT_BYTES: usize = 512 * 1024;
 
@@ -516,6 +534,10 @@ struct SenpaiApp {
     render_started: Option<f64>,
     /// Page the counter last reported, so a turn can be noticed.
     last_shown_page: usize,
+    /// Where in the bar the counter's slot was reserved this frame. The
+    /// capsule stands in the same place, so the number does not move
+    /// when the bar arrives around it.
+    page_slot_x: f32,
     /// When the lone capsule should stop being shown. Only meaningful
     /// while the bar is hidden; with the bar up the number is in it.
     page_flash_until: f64,
@@ -597,6 +619,7 @@ impl SenpaiApp {
             render_started: None,
             last_shown_page: 0,
             page_flash_until: 0.0,
+            page_slot_x: 0.0,
         };
         configure_context(&cc.egui_ctx);
         theme::install(&cc.egui_ctx, app.dark_mode);
@@ -1326,6 +1349,7 @@ impl SenpaiApp {
         let slide = 2.0 + 10.0 * egui::emath::easing::cubic_out(text_t);
         theme::page_counter(
             ctx,
+            self.page_slot_x,
             slide,
             &format!("{} / {}", self.current_page + 1, self.page_count),
             text_t,
@@ -1559,15 +1583,18 @@ impl SenpaiApp {
     /// The top bar. `fade` is 0..1 from the caller's animation, so the bar
     /// can slide/fade in and out instead of popping on hover.
     fn show_top_bar(&mut self, ctx: &egui::Context, fade: f32) {
-        if fade <= 0.001 {
-            // Fully hidden: don't paint, and crucially don't register the
-            // bar's click targets, or an invisible bar would still eat
-            // clicks meant for the page.
+        // A hidden bar is laid out all the same, at zero opacity and
+        // taking no input. It has to be: the page capsule stands exactly
+        // where the bar's own counter stands, and the only way to know
+        // where that is without reimplementing the bar's arithmetic in a
+        // second place is to let the bar work it out. Laying out a
+        // handful of widgets costs nothing; the clicks are what matter,
+        // and `interactable` is what stops an invisible bar eating them.
+        let hidden = fade <= 0.001;
+        if hidden {
             self.close_menu();
             self.menu_painting = None;
-            self.bar_rect = egui::Rect::NOTHING;
             self.menu_rect = egui::Rect::NOTHING;
-            return;
         }
 
         let screen_width = ctx.screen_rect().width();
@@ -1582,6 +1609,7 @@ impl SenpaiApp {
         let bar = egui::Area::new(egui::Id::new("top_bar"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, slide))
             .order(egui::Order::Foreground)
+            .interactable(!hidden)
             .show(ctx, |ui| {
                 ui.set_opacity(fade);
                 ui.set_width(bar_width);
@@ -1597,16 +1625,16 @@ impl SenpaiApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
+                                    // Three buttons on the left, one
+                                    // button and two readouts on the
+                                    // right. Reading leftwards from the
+                                    // edge: Options, the zoom, then the
+                                    // page. Both readouts are set
+                                    // quieter than the buttons, being
+                                    // things to read rather than press.
                                     self.menu_button(ui, "Options", Menu::Options);
-                                    // Right-hand end, beside Options: a
-                                    // readout rather than a control, so
-                                    // it sits quieter than the buttons
-                                    // and well clear of the page counter
-                                    // in the middle. Hidden with no
-                                    // document, where it would be
-                                    // reporting on nothing.
                                     if self.has_document() {
-                                        ui.add_space(8.0);
+                                        ui.add_space(10.0);
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "{}%",
@@ -1616,12 +1644,37 @@ impl SenpaiApp {
                                             .size(theme::COUNTER_FONT - 1.0),
                                         );
                                     }
+                                    if self.page_count > 0 {
+                                        ui.add_space(14.0);
+                                        // A blank slot, not the number:
+                                        // the number is painted once, by
+                                        // `show_page_counter`, over
+                                        // whichever surface is there to
+                                        // receive it. Reserving the room
+                                        // here is what keeps the two in
+                                        // the same place.
+                                        let (slot, _) = ui.allocate_exact_size(
+                                            egui::vec2(
+                                                page_counter_width(ctx, self.page_count),
+                                                theme::PILL_HEIGHT,
+                                            ),
+                                            egui::Sense::hover(),
+                                        );
+                                        self.page_slot_x = slot.center().x;
+                                    }
                                 },
                             );
                         });
                     });
             });
-        self.bar_rect = bar.response.rect;
+        self.bar_rect = if hidden {
+            egui::Rect::NOTHING
+        } else {
+            bar.response.rect
+        };
+        if hidden {
+            return;
+        }
 
         // Painted from `menu_painting`, not `open_menu`, so closing
         // animates symmetrically with opening instead of cutting out.

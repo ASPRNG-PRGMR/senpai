@@ -658,20 +658,39 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
 /// aligned by hand and would drift the moment either one's padding
 /// changed, so there is one widget and two backgrounds.
 ///
-/// Geometry is tied to the bar's: the same centre-top anchor, the same
-/// 7px vertical margin, and a content box of exactly [`PILL_HEIGHT`],
-/// which is what the bar's own buttons stand at. That makes the capsule
-/// the same height as the bar by construction rather than by a matching
-/// pair of constants.
-pub fn page_counter(ctx: &egui::Context, offset_y: f32, text: &str, text_t: f32, frame_t: f32) {
+/// `center_x` is where the bar reserved room for it, so the glyphs land
+/// in the same place whichever surface is behind them. The vertical
+/// geometry is the bar's own: `top_y` is the bar's offset from the top
+/// of the window, the 7px margin is the bar's margin, and the content
+/// box is exactly [`PILL_HEIGHT`], which is what the bar's buttons stand
+/// at. The capsule is therefore the bar's height by construction rather
+/// than by a pair of constants that happen to agree.
+///
+/// Painted above `Order::Foreground` rather than on it. egui raises a
+/// layer to the top when it is clicked, so sharing an order with the bar
+/// meant that opening a menu once could leave the bar permanently above
+/// the number -- which reads as the counter simply not being there.
+pub fn page_counter(
+    ctx: &egui::Context,
+    center_x: f32,
+    top_y: f32,
+    text: &str,
+    text_t: f32,
+    frame_t: f32,
+) {
     if text_t <= 0.001 {
         return;
     }
+    let font = egui::FontId::proportional(COUNTER_FONT);
+    let text_w = ctx
+        .fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE))
+        .size()
+        .x;
     egui::Area::new(egui::Id::new("page_counter"))
-        .anchor(Align2::CENTER_TOP, vec2(0.0, offset_y))
-        .order(egui::Order::Foreground)
+        .fixed_pos(pos2(center_x - (text_w + 28.0) / 2.0, top_y))
+        .order(egui::Order::Tooltip)
         // Never takes a click: it is a readout, and swallowing presses
-        // here would punch a hole in the middle of the bar.
+        // here would punch a hole in the bar it sits on.
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::none()
@@ -681,16 +700,11 @@ pub fn page_counter(ctx: &egui::Context, offset_y: f32, text: &str, text_t: f32,
                 .shadow(soft_shadow(frame_t))
                 .inner_margin(egui::Margin::symmetric(14.0, 7.0))
                 .show(ui, |ui| {
-                    let font = egui::FontId::proportional(COUNTER_FONT);
                     // Sized to the text, so a four-digit page count gets
                     // the room it needs and a single-digit one does not
                     // leave a gap. One line either side of the slash.
-                    let width = ui
-                        .fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE))
-                        .size()
-                        .x;
                     let (rect, _) =
-                        ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::hover());
+                        ui.allocate_exact_size(vec2(text_w, PILL_HEIGHT), Sense::hover());
                     ui.painter().text(
                         rect.center(),
                         Align2::CENTER_CENTER,
