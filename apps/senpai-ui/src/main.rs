@@ -38,6 +38,7 @@
 //! Known broken, NOT default (Paged is the startup mode): Continuous
 //! Scroll mode. Deferred to after this release.
 
+mod markdown;
 mod recent;
 mod theme;
 
@@ -144,22 +145,54 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// fixed 330px wide and shares that space with the Open button and the
 /// current document's details; more than this and the menu stops being
 /// something you can read at a glance.
+/// Starting zoom. Pages render at 1.5x by default; for Markdown this is
+/// the divisor that turns the same number into a type-size multiplier,
+/// so the reader opens at the base font size.
+const DEFAULT_SCALE: f64 = 1.5;
 const RECENT_IN_MENU: usize = 6;
 /// Budget for an entry's label, in characters. The dropdown's pills do
 /// not wrap or truncate on their own -- a long name would simply push
 /// the pill wider than the card.
 const RECENT_NAME_CHARS: usize = 34;
 
+/// What `open_document` resolved a path to. Boxed on the PDF side
+/// because an engine plus its metadata is far larger than a parsed
+/// Markdown document, and a lopsided enum would make every move of it
+/// pay for the bigger arm.
+enum DocumentContent {
+    Pdf(Box<(PopplerEngine, usize, PageSize)>),
+    Markdown(markdown::Document),
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|e| {
+        let e = e.to_string_lossy().to_lowercase();
+        e == "md" || e == "markdown" || e == "mdown" || e == "mkd"
+    })
+}
+
+/// Reads and parses a Markdown file.
+///
+/// Read whole rather than mapped, unlike a PDF: the parser walks the
+/// entire text anyway, the files are small, and it has to be valid UTF-8
+/// to be text at all. Invalid bytes are replaced rather than rejected --
+/// a stray byte in a mostly-readable file should not stop it opening.
+fn load_markdown(path: &Path) -> Result<markdown::Document, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("could not open: {e}"))?;
+    Ok(markdown::parse(&String::from_utf8_lossy(&bytes)))
+}
+
 /// Picks which of several dropped files to open.
 ///
-/// A `.pdf` wins outright. Failing that the first file is taken anyway
-/// rather than the drop being ignored: a PDF with no extension is a real
-/// thing, and when it genuinely is not one, letting the loader fail says
-/// which file and why -- which silently doing nothing does not.
-fn pick_dropped_pdf(paths: &[PathBuf]) -> Option<&Path> {
+/// Something this reader knows how to open -- a PDF or a Markdown file
+/// -- wins outright. Failing that the first file is taken anyway rather
+/// than the drop being ignored: a PDF with no extension is a real thing,
+/// and when it genuinely is not one, letting the loader fail says which
+/// file and why -- which silently doing nothing does not.
+fn pick_dropped_document(paths: &[PathBuf]) -> Option<&Path> {
     paths
         .iter()
-        .find(|p| is_pdf(p))
+        .find(|p| is_pdf(p) || is_markdown(p))
         .or_else(|| paths.first())
         .map(PathBuf::as_path)
 }
@@ -389,6 +422,13 @@ struct SenpaiApp {
     /// Documents opened before, newest first. Also decides where the
     /// file dialog starts -- see the note at the top of `recent.rs`.
     recent: recent::Recent,
+    /// The parsed document when a Markdown file is open. Mutually
+    /// exclusive with a PDF: installing either clears the other.
+    markdown: Option<markdown::Document>,
+    /// Pixels the Markdown view should scroll on the next frame, from a
+    /// page-navigation key. Applied inside the scroll area, which is the
+    /// only place the offset can be changed.
+    md_scroll: f32,
     /// Name shown on the drag-and-drop overlay. Kept after the pointer
     /// leaves so the card still reads correctly while it fades out --
     /// clearing it with the hover would blank the text mid-fade.
@@ -448,7 +488,7 @@ impl SenpaiApp {
             page_count: 0,
             doc_path: None,
             current_page: 0,
-            scale: 1.5,
+            scale: DEFAULT_SCALE,
             estimated_page_size: FALLBACK_PAGE_SIZE,
             known_page_heights: Vec::new(),
             shared: None,
@@ -471,6 +511,8 @@ impl SenpaiApp {
             pending_open: None,
             open_error: None,
             recent: recent::Recent::load(),
+            markdown: None,
+            md_scroll: 0.0,
             drop_label: None,
             render_started: None,
             last_shown_page: 0,
@@ -513,8 +555,13 @@ impl SenpaiApp {
         let ctx = ctx.clone();
         thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new()
-                .set_title("Open a PDF")
-                .add_filter("PDF document", &["pdf"]);
+                .set_title("Open a document")
+                // The combined filter goes first because it is the
+                // default selection, and "anything this reader opens" is
+                // what someone browsing actually wants to see.
+                .add_filter("Documents", &["pdf", "md", "markdown", "mdown", "mkd"])
+                .add_filter("PDF document", &["pdf"])
+                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"]);
             if let Some(dir) = start_dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -574,7 +621,7 @@ impl SenpaiApp {
         let t = ctx.animate_bool_with_time(egui::Id::new("drop_fade"), hovering, theme::T_PANEL);
         theme::drop_overlay(ctx, t, self.drop_label.as_deref());
 
-        if let Some(path) = pick_dropped_pdf(&dropped) {
+        if let Some(path) = pick_dropped_document(&dropped) {
             let path = path.to_path_buf();
             // A drop is a deliberate "open this now"; a menu left open
             // over the top of it would just be in the way.
@@ -583,10 +630,32 @@ impl SenpaiApp {
         }
     }
 
+    /// Opens whatever the path points at, picking the reader by
+    /// extension.
+    ///
+    /// Extension rather than content sniffing: a `.md` file is plain
+    /// text and has no magic number to find, so the name is the only
+    /// thing that distinguishes it from any other text file. A PDF is
+    /// the default because that is what this reader is for, and
+    /// poppler's own error is a better answer for a mislabelled file
+    /// than a guess would be.
     fn open_document(&mut self, ctx: &egui::Context, path: &Path) {
-        match load_document(path) {
-            Ok((engine, page_count, size)) => {
+        let result = if is_markdown(path) {
+            load_markdown(path).map(DocumentContent::Markdown)
+        } else {
+            load_document(path).map(|(engine, page_count, size)| {
+                DocumentContent::Pdf(Box::new((engine, page_count, size)))
+            })
+        };
+        match result {
+            Ok(DocumentContent::Pdf(boxed)) => {
+                let (engine, page_count, size) = *boxed;
                 self.install_document(ctx, path, engine, page_count, size);
+                self.open_error = None;
+                self.recent.record(path);
+            }
+            Ok(DocumentContent::Markdown(doc)) => {
+                self.install_markdown(ctx, path, doc);
                 self.open_error = None;
                 self.recent.record(path);
             }
@@ -594,6 +663,23 @@ impl SenpaiApp {
                 self.open_error = Some(format!("{}: {e}", path.display()));
             }
         }
+    }
+
+    /// Swaps in a Markdown document, retiring any PDF worker first.
+    ///
+    /// Shares `retire_worker` with the PDF path rather than duplicating
+    /// it: leaving a worker running against a document nobody is looking
+    /// at would keep its engine handle -- and its memory -- alive for as
+    /// long as the app ran.
+    fn install_markdown(&mut self, ctx: &egui::Context, path: &Path, doc: markdown::Document) {
+        self.retire_worker();
+        self.page_count = 0;
+        self.current_page = 0;
+        self.known_page_heights.clear();
+        self.md_scroll = 0.0;
+        self.markdown = Some(doc);
+        self.doc_path = Some(path.to_path_buf());
+        self.set_window_title(ctx, path);
     }
 
     /// Retires the previous document's worker and swaps in a new one.
@@ -609,26 +695,8 @@ impl SenpaiApp {
         page_count: usize,
         estimated_page_size: PageSize,
     ) {
-        if let Some(old) = self.shared.take() {
-            let (lock, cvar) = &*old;
-            let mut guard = lock.lock().unwrap();
-            guard.shutdown = true;
-            guard.primary = None;
-            guard.prefetch.clear();
-            cvar.notify_all();
-        }
-        // Dropping the receiver makes any result the old worker still
-        // sends a no-op, so a late render can't land on the new document.
-        self.result_rx = None;
-
-        // The old document's textures go through pending_evictions rather
-        // than being dropped here: this runs mid-update(), and dropping a
-        // texture in the same frame that may already have queued paint
-        // commands referencing it is exactly the wgpu "texture has been
-        // destroyed" race that pending_evictions exists to avoid.
-        while let Some((_key, handle)) = self.textures.pop_lru() {
-            self.pending_evictions.push(handle);
-        }
+        self.retire_worker();
+        self.markdown = None;
 
         let shared: Shared = Arc::new((
             Mutex::new(WorkerState {
@@ -656,11 +724,48 @@ impl SenpaiApp {
         self.render_pending = false;
         self.continuous_render_pending = false;
 
+        self.set_window_title(ctx, path);
+    }
+
+    /// Shuts down the render worker and releases the textures it filled.
+    ///
+    /// Order matters: the old worker is told to stop *before* a new one
+    /// is spawned, so the two never render the same document, and the
+    /// old engine handle is dropped on the thread that owned it.
+    fn retire_worker(&mut self) {
+        if let Some(old) = self.shared.take() {
+            let (lock, cvar) = &*old;
+            let mut guard = lock.lock().unwrap();
+            guard.shutdown = true;
+            guard.primary = None;
+            guard.prefetch.clear();
+            cvar.notify_all();
+        }
+        // Dropping the receiver makes any result the old worker still
+        // sends a no-op, so a late render can't land on the new document.
+        self.result_rx = None;
+
+        // The old document's textures go through pending_evictions rather
+        // than being dropped here: this runs mid-update(), and dropping a
+        // texture in the same frame that may already have queued paint
+        // commands referencing it is exactly the wgpu "texture has been
+        // destroyed" race that pending_evictions exists to avoid.
+        while let Some((_key, handle)) = self.textures.pop_lru() {
+            self.pending_evictions.push(handle);
+        }
+    }
+
+    fn set_window_title(&self, ctx: &egui::Context, path: &Path) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — senpai")));
+    }
+
+    /// Whether anything is open at all, in either reader.
+    fn has_document(&self) -> bool {
+        self.page_count > 0 || self.markdown.is_some()
     }
 
     fn insert_texture(&mut self, key: (usize, u64), handle: egui::TextureHandle) {
@@ -886,7 +991,19 @@ impl eframe::App for SenpaiApp {
                     i.key_pressed(egui::Key::Minus),
                 )
             });
-            if self.view_mode == ViewMode::Paged {
+            if self.markdown.is_some() {
+                // The page keys keep meaning "move on by one screenful"
+                // in a format that has no pages. Slightly less than a
+                // full screen, so a line or two carries over and the eye
+                // has somewhere to land.
+                let step = ctx.screen_rect().height() * 0.85;
+                if want_next {
+                    self.md_scroll += step;
+                }
+                if want_prev {
+                    self.md_scroll -= step;
+                }
+            } else if self.view_mode == ViewMode::Paged {
                 if want_next {
                     self.next_page();
                 }
@@ -942,7 +1059,7 @@ impl eframe::App for SenpaiApp {
         let bar_visible = !self.auto_hide_enabled
             || hovering_top
             || self.open_menu.is_some()
-            || self.page_count == 0;
+            || !self.has_document();
 
         self.poll_pending_open(ctx);
         self.drain_results(ctx);
@@ -959,8 +1076,14 @@ impl eframe::App for SenpaiApp {
         let bar_t =
             ctx.animate_bool_with_time(egui::Id::new("bar_fade"), bar_visible, theme::T_PANEL);
 
-        if self.page_count == 0 {
+        if !self.has_document() {
             self.show_empty_state(ctx, bg);
+            self.show_top_bar(ctx, bar_t);
+            return;
+        }
+
+        if self.markdown.is_some() {
+            self.show_markdown_view(ctx, bg);
             self.show_top_bar(ctx, bar_t);
             return;
         }
@@ -1110,6 +1233,41 @@ impl SenpaiApp {
                                 .color(egui::Color32::from_rgb(224, 120, 120))
                                 .size(11.5),
                         );
+                    }
+                });
+            });
+    }
+
+    /// The Markdown reader: one scrolling, centred reading column.
+    ///
+    /// No paging, no render cache, no prefetch -- see the note at the top
+    /// of `markdown.rs` for why this format does not go through the page
+    /// pipeline the rest of the reader is built on.
+    fn show_markdown_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
+        let zoom = (self.scale / DEFAULT_SCALE) as f32;
+        let scroll = std::mem::take(&mut self.md_scroll);
+        let Some(doc) = &self.markdown else {
+            return;
+        };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(bg))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let width = markdown::column_width(ui.available_width(), zoom);
+                    let gutter = ((ui.available_width() - width) / 2.0).max(0.0);
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(gutter);
+                        ui.vertical(|ui| {
+                            ui.set_width(width);
+                            ui.add_space(30.0 * zoom);
+                            markdown::show(ui, doc, zoom);
+                            // Room to scroll the last line clear of the
+                            // bottom edge, the way a page has a margin.
+                            ui.add_space(60.0 * zoom);
+                        });
+                    });
+                    if scroll != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(0.0, -scroll));
                     }
                 });
             });
@@ -1386,8 +1544,18 @@ impl SenpaiApp {
                 .unwrap_or_else(|| path.display().to_string());
             ui.add_space(2.0);
             ui.label(egui::RichText::new(name).color(theme::TEXT_DIM).size(11.5));
+            let detail = match &self.markdown {
+                // A Markdown file has no page count to report, so say
+                // what it is instead -- the view behaves differently and
+                // the menu is where that is explained.
+                Some(doc) => match &doc.title {
+                    Some(title) => format!("Markdown — {title}"),
+                    None => "Markdown".to_owned(),
+                },
+                None => format!("{} pages", self.page_count),
+            };
             ui.label(
-                egui::RichText::new(format!("{} pages", self.page_count))
+                egui::RichText::new(elide(&detail, RECENT_NAME_CHARS))
                     .color(theme::TEXT_FAINT)
                     .size(10.5),
             );
@@ -1476,20 +1644,31 @@ impl SenpaiApp {
 
         theme::divider(ui);
         theme::section_label(ui, "View mode");
-        let current = (self.view_mode == ViewMode::Continuous) as usize;
-        if let Some(i) = theme::segmented(ui, "view_seg", &["Paged", "Continuous"], current) {
-            self.set_view_mode(if i == 1 {
-                ViewMode::Continuous
-            } else {
-                ViewMode::Paged
-            });
-        }
-        if self.view_mode == ViewMode::Continuous {
+        if self.markdown.is_some() {
+            // Offering a switch that does nothing is worse than not
+            // offering it: Markdown reflows to the window by nature, so
+            // neither mode has anything to apply to.
             ui.label(
-                egui::RichText::new("Experimental — known broken.")
-                    .color(egui::Color32::from_rgb(224, 170, 110))
+                egui::RichText::new("Markdown reflows to the window. View modes apply to PDFs.")
+                    .color(theme::TEXT_FAINT)
                     .size(10.5),
             );
+        } else {
+            let current = (self.view_mode == ViewMode::Continuous) as usize;
+            if let Some(i) = theme::segmented(ui, "view_seg", &["Paged", "Continuous"], current) {
+                self.set_view_mode(if i == 1 {
+                    ViewMode::Continuous
+                } else {
+                    ViewMode::Paged
+                });
+            }
+            if self.view_mode == ViewMode::Continuous {
+                ui.label(
+                    egui::RichText::new("Experimental — known broken.")
+                        .color(egui::Color32::from_rgb(224, 170, 110))
+                        .size(10.5),
+                );
+            }
         }
 
         theme::divider(ui);
@@ -1553,7 +1732,9 @@ impl SenpaiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{elide, pick_dropped_pdf, should_dismiss_menu, RECENT_NAME_CHARS};
+    use super::{
+        elide, is_markdown, pick_dropped_document, should_dismiss_menu, RECENT_NAME_CHARS,
+    };
     use eframe::egui::{pos2, Rect};
     use std::path::{Path, PathBuf};
 
@@ -1661,13 +1842,16 @@ mod tests {
 
     #[test]
     fn nothing_dropped_opens_nothing() {
-        assert_eq!(pick_dropped_pdf(&[]), None);
+        assert_eq!(pick_dropped_document(&[]), None);
     }
 
     #[test]
     fn a_pdf_wins_over_whatever_else_came_with_it() {
         let dropped = paths(&["/notes.txt", "/book.pdf", "/other.pdf"]);
-        assert_eq!(pick_dropped_pdf(&dropped), Some(Path::new("/book.pdf")));
+        assert_eq!(
+            pick_dropped_document(&dropped),
+            Some(Path::new("/book.pdf"))
+        );
     }
 
     /// Dragging from a file manager can produce an upper-case extension,
@@ -1675,14 +1859,36 @@ mod tests {
     #[test]
     fn the_extension_match_ignores_case() {
         let dropped = paths(&["/notes.txt", "/BOOK.PDF"]);
-        assert_eq!(pick_dropped_pdf(&dropped), Some(Path::new("/BOOK.PDF")));
+        assert_eq!(
+            pick_dropped_document(&dropped),
+            Some(Path::new("/BOOK.PDF"))
+        );
     }
 
     /// Not a refusal: the loader gets to say what is wrong with it, by
     /// name. An extensionless PDF opens by this path too.
     #[test]
-    fn without_a_pdf_the_first_file_is_tried_anyway() {
+    fn without_a_known_type_the_first_file_is_tried_anyway() {
         let dropped = paths(&["/scan", "/notes.txt"]);
-        assert_eq!(pick_dropped_pdf(&dropped), Some(Path::new("/scan")));
+        assert_eq!(pick_dropped_document(&dropped), Some(Path::new("/scan")));
+    }
+
+    #[test]
+    fn a_dropped_markdown_file_is_opened_too() {
+        let dropped = paths(&["/notes.txt", "/README.md"]);
+        assert_eq!(
+            pick_dropped_document(&dropped),
+            Some(Path::new("/README.md"))
+        );
+    }
+
+    #[test]
+    fn markdown_is_recognised_by_its_usual_extensions_in_any_case() {
+        for name in ["a.md", "a.MD", "a.markdown", "a.mdown", "a.mkd"] {
+            assert!(is_markdown(Path::new(name)), "{name} should be markdown");
+        }
+        for name in ["a.pdf", "a.txt", "a", "a.mdx"] {
+            assert!(!is_markdown(Path::new(name)), "{name} should not be");
+        }
     }
 }

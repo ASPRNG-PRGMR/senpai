@@ -24,6 +24,12 @@ lru = "0.12"
 # Windows DLL bundle is unaffected.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
+# CommonMark parsing for the Markdown reader. Pure Rust with no
+# transitive dependencies of its own, so it adds nothing to the Windows
+# DLL bundle; `default-features = false` drops the HTML writer, which is
+# the opposite of what a reader needs.
+pulldown-cmark = { version = "0.13", default-features = false }
+
 [build-dependencies]
 winres = "0.1"
 
