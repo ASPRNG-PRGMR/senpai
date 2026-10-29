@@ -956,6 +956,16 @@ impl SenpaiApp {
         self.clear_pending_prefetch();
     }
 
+    /// Back to the level a document opens at -- the 100% the bar reports.
+    ///
+    /// The ladder is multiplicative, so stepping back by hand means
+    /// landing on 104% or 96% and not being able to tell which. A reset
+    /// is the only way to actually return to where you started.
+    fn reset_zoom(&mut self) {
+        self.scale = DEFAULT_SCALE;
+        self.clear_pending_prefetch();
+    }
+
     fn set_view_mode(&mut self, mode: ViewMode) {
         if self.view_mode != mode {
             self.view_mode = mode;
@@ -1021,18 +1031,23 @@ impl eframe::App for SenpaiApp {
                 self.rebinding = None;
             }
         } else {
-            let (want_next, want_prev, want_zoom_in, want_zoom_out) = ctx.input(|i| {
-                (
-                    i.key_pressed(self.nav_keys.next) || i.key_pressed(egui::Key::Space),
-                    i.key_pressed(self.nav_keys.prev),
-                    // Modifiers deliberately unchecked: Ctrl and a plus
-                    // key means the same thing here as the plus key on
-                    // its own, now that egui is not also listening for
-                    // it. See `configure_context`.
-                    i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
-                    i.key_pressed(egui::Key::Minus),
-                )
-            });
+            let (want_next, want_prev, want_zoom_in, want_zoom_out, want_zoom_reset) =
+                ctx.input(|i| {
+                    (
+                        i.key_pressed(self.nav_keys.next) || i.key_pressed(egui::Key::Space),
+                        i.key_pressed(self.nav_keys.prev),
+                        // Modifiers deliberately unchecked: Ctrl and a
+                        // plus key means the same thing here as the plus
+                        // key on its own, now that egui is not also
+                        // listening for it. See `configure_context`.
+                        i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                        i.key_pressed(egui::Key::Minus),
+                        // This one does want the modifier: `0` alone is
+                        // a page-navigation key someone could rebind to,
+                        // and it is a digit a reader might simply type.
+                        i.modifiers.command && i.key_pressed(egui::Key::Num0),
+                    )
+                });
             if self.markdown.is_some() {
                 // The page keys keep meaning "move on by one screenful"
                 // in a format that has no pages. Slightly less than a
@@ -1058,6 +1073,9 @@ impl eframe::App for SenpaiApp {
             }
             if want_zoom_out {
                 self.zoom_out();
+            }
+            if want_zoom_reset {
+                self.reset_zoom();
             }
 
             let (alt_f, alt_t, alt_m, alt_o, ctrl_o, escape) = ctx.input(|i| {
