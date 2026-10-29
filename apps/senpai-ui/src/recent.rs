@@ -19,11 +19,13 @@
 //! to an error.
 
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// How many entries are kept on disk.
 pub const CAPACITY: usize = 10;
+
+/// Name of the file this list lives in. See [`crate::config`].
+const STORE: &str = "recent";
 
 #[derive(Default)]
 pub struct Recent {
@@ -39,8 +41,7 @@ impl Recent {
     /// such an entry is then gone for good; "it is in the menu" staying
     /// equivalent to "it opens" is worth more than that.
     pub fn load() -> Self {
-        let paths = store_path()
-            .and_then(|p| fs::read_to_string(p).ok())
+        let paths = crate::config::read(STORE)
             .map(|text| {
                 let mut paths = parse(&text);
                 paths.retain(|p| p.is_file());
@@ -76,18 +77,12 @@ impl Recent {
     /// working reader, so a failure here is not worth interrupting
     /// anyone over.
     fn save(&self) {
-        let Some(path) = store_path() else {
-            return;
-        };
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
         let mut text = String::new();
         for p in &self.paths {
             text.push_str(&p.to_string_lossy());
             text.push('\n');
         }
-        let _ = fs::write(path, text);
+        crate::config::write(STORE, &text);
     }
 }
 
@@ -125,23 +120,6 @@ fn parse(text: &str) -> Vec<PathBuf> {
 /// Windows it does not hand back a `\\?\` verbatim path.
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// `%APPDATA%\senpai\recent` on Windows, `$XDG_CONFIG_HOME/senpai/recent`
-/// (or `~/.config`) elsewhere.
-///
-/// Under Wine these resolve to the prefix's own AppData, so a Wine build
-/// and a native build keep separate lists -- which is correct, since
-/// their paths are not interchangeable anyway.
-fn store_path() -> Option<PathBuf> {
-    let dir = if cfg!(windows) {
-        PathBuf::from(env::var_os("APPDATA")?)
-    } else {
-        env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
-    };
-    Some(dir.join("senpai").join("recent"))
 }
 
 /// Where to point the dialog when there is no history at all: the

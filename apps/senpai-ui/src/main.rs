@@ -38,11 +38,14 @@
 //! Known broken, NOT default (Paged is the startup mode): Continuous
 //! Scroll mode. Deferred to after this release.
 
+mod config;
+mod keybinds;
 mod markdown;
 mod recent;
 mod theme;
 
 use eframe::egui;
+use keybinds::{NavKeys, NavTarget, Preset};
 use lru::LruCache;
 use senpai_core::engine::{PdfEngine, PdfEngineOpen};
 use senpai_core::file_loader::LoadedFile;
@@ -106,26 +109,6 @@ enum Menu {
 enum ViewMode {
     Paged,
     Continuous,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NavTarget {
-    Prev,
-    Next,
-}
-
-struct NavKeys {
-    prev: egui::Key,
-    next: egui::Key,
-}
-
-impl Default for NavKeys {
-    fn default() -> Self {
-        Self {
-            prev: egui::Key::ArrowLeft,
-            next: egui::Key::ArrowRight,
-        }
-    }
 }
 
 const CACHE_CAPACITY: usize = 30;
@@ -505,6 +488,9 @@ struct SenpaiApp {
     view_mode: ViewMode,
     nav_keys: NavKeys,
     rebinding: Option<NavTarget>,
+    /// A key the reader tried to assign that is spoken for already, kept
+    /// only long enough to say so.
+    rebind_rejected: Option<egui::Key>,
     open_menu: Option<Menu>,
     /// Where the bar and the open dropdown were painted last frame, used
     /// to decide whether a click landed on the chrome or outside it.
@@ -609,8 +595,9 @@ impl SenpaiApp {
             dark_mode: true,
             auto_hide_enabled: true,
             view_mode: ViewMode::Paged,
-            nav_keys: NavKeys::default(),
+            nav_keys: NavKeys::load(),
             rebinding: None,
+            rebind_rejected: None,
             open_menu: None,
             bar_rect: egui::Rect::NOTHING,
             menu_rect: egui::Rect::NOTHING,
@@ -1106,47 +1093,77 @@ impl eframe::App for SenpaiApp {
             if escape {
                 self.rebinding = None;
             } else if let Some(key) = captured {
-                match target {
-                    NavTarget::Prev => self.nav_keys.prev = key,
-                    NavTarget::Next => self.nav_keys.next = key,
+                if keybinds::is_assignable(key) {
+                    self.nav_keys.bind(target, key);
+                    self.nav_keys.save();
+                    self.rebind_rejected = None;
+                } else {
+                    // Refused rather than silently ignored: pressing a
+                    // key and having nothing happen reads as the feature
+                    // being broken.
+                    self.rebind_rejected = Some(key);
                 }
                 self.rebinding = None;
             }
         } else {
-            let (want_next, want_prev, want_zoom_in, want_zoom_out, want_zoom_reset) =
-                ctx.input(|i| {
-                    (
-                        i.key_pressed(self.nav_keys.next) || i.key_pressed(egui::Key::Space),
-                        i.key_pressed(self.nav_keys.prev),
-                        // Modifiers deliberately unchecked: Ctrl and a
-                        // plus key means the same thing here as the plus
-                        // key on its own, now that egui is not also
-                        // listening for it. See `configure_context`.
-                        i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
-                        i.key_pressed(egui::Key::Minus),
-                        // This one does want the modifier: `0` alone is
-                        // a page-navigation key someone could rebind to,
-                        // and it is a digit a reader might simply type.
-                        i.modifiers.command && i.key_pressed(egui::Key::Num0),
-                    )
-                });
+            let keys = self.nav_keys;
+            let (nav, want_zoom_in, want_zoom_out, want_zoom_reset) = ctx.input(|i| {
+                // A direction fires on its built-in keys or on whatever
+                // the reader has bound to it. Built-ins are never taken
+                // away, so a binding can only add a way to move.
+                let asked = |target: NavTarget| {
+                    target.builtins().iter().any(|k| i.key_pressed(*k))
+                        || keys.get(target).is_some_and(|k| i.key_pressed(k))
+                };
+                (
+                    [
+                        asked(NavTarget::Left),
+                        asked(NavTarget::Right),
+                        asked(NavTarget::Up),
+                        asked(NavTarget::Down),
+                    ],
+                    // Modifiers deliberately unchecked: Ctrl and a plus
+                    // key means the same thing here as the plus key on
+                    // its own, now that egui is not also listening for
+                    // it. See `configure_context`.
+                    i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                    i.key_pressed(egui::Key::Minus),
+                    // This one does want the modifier: `0` alone is a
+                    // key someone could bind a direction to, and it is a
+                    // digit a reader might simply type.
+                    i.modifiers.command && i.key_pressed(egui::Key::Num0),
+                )
+            });
+            let [want_left, want_right, want_up, want_down] = nav;
             if self.text.is_some() {
-                // The page keys keep meaning "move on by one screenful"
-                // in a format that has no pages. Slightly less than a
-                // full screen, so a line or two carries over and the eye
-                // has somewhere to land.
-                let step = ctx.screen_rect().height() * 0.85;
-                if want_next {
-                    self.md_scroll += step;
+                // Left and right keep meaning "move on by one
+                // screenful" in a format that has no pages. Slightly
+                // less than a full screen, so a line or two carries over
+                // and the eye has somewhere to land. Up and down are the
+                // finer movement: a few lines, the way an arrow key
+                // behaves in anything else that scrolls.
+                let screen = ctx.screen_rect().height();
+                if want_right {
+                    self.md_scroll += screen * 0.85;
                 }
-                if want_prev {
-                    self.md_scroll -= step;
+                if want_left {
+                    self.md_scroll -= screen * 0.85;
+                }
+                if want_down {
+                    self.md_scroll += screen * 0.2;
+                }
+                if want_up {
+                    self.md_scroll -= screen * 0.2;
                 }
             } else if self.view_mode == ViewMode::Paged {
-                if want_next {
+                // A page is fitted to the window, so there is nothing
+                // for up and down to scroll. Rather than have them do
+                // nothing, they turn pages too -- which is what every
+                // other reader does once a page fits.
+                if want_right || want_down {
                     self.next_page();
                 }
-                if want_prev {
+                if want_left || want_up {
                     self.prev_page();
                 }
             }
@@ -1912,33 +1929,23 @@ impl SenpaiApp {
                 );
             }
         }
-
-        theme::divider(ui);
-        theme::section_label(ui, "Page navigation keys");
-        self.rebind_row(ui, "Previous", NavTarget::Prev);
-        self.rebind_row(ui, "Next", NavTarget::Next);
-        if self.rebinding.is_some() {
-            ui.label(
-                egui::RichText::new("Press any key, or Escape to cancel.")
-                    .color(theme::text_faint())
-                    .size(10.5),
-            );
-        }
     }
 
-    fn rebind_row(&mut self, ui: &mut egui::Ui, label: &str, target: NavTarget) {
-        let key = match target {
-            NavTarget::Prev => self.nav_keys.prev,
-            NavTarget::Next => self.nav_keys.next,
-        };
+    fn rebind_row(&mut self, ui: &mut egui::Ui, target: NavTarget) {
         let listening = self.rebinding == Some(target);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(label).color(theme::text()).size(12.5));
+            ui.label(
+                egui::RichText::new(target.label())
+                    .color(theme::text())
+                    .size(12.5),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let caption = if listening {
-                    "press a key…".to_string()
-                } else {
-                    format!("{key:?}")
+                let caption = match (listening, self.nav_keys.get(target)) {
+                    (true, _) => "press a key…".to_owned(),
+                    (false, Some(key)) => key.name().to_owned(),
+                    // Not "none": nothing is unbound here, the built-in
+                    // keys are simply all there is.
+                    (false, None) => "—".to_owned(),
                 };
                 let style = if listening {
                     PillStyle::Selected
@@ -1948,10 +1955,11 @@ impl SenpaiApp {
                 if Pill::new(&caption)
                     .style(style)
                     .small()
-                    .min_width(98.0)
+                    .min_width(104.0)
                     .show(ui)
                     .clicked()
                 {
+                    self.rebind_rejected = None;
                     self.rebinding = if listening { None } else { Some(target) };
                 }
             });
@@ -1969,6 +1977,63 @@ impl SenpaiApp {
                 .color(theme::text_faint())
                 .size(10.5),
         );
+
+        theme::divider(ui);
+        theme::section_label(ui, "Navigation keys");
+        ui.label(
+            egui::RichText::new(
+                "Arrows, Page Up/Down and Space always work. Anything set here is extra.",
+            )
+            .color(theme::text_faint())
+            .size(10.5),
+        );
+        ui.add_space(3.0);
+        for target in NavTarget::ALL {
+            self.rebind_row(ui, target);
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            for preset in [Preset::Vim, Preset::Gamer] {
+                if Pill::new(preset.label())
+                    .selected(self.nav_keys.matches(preset))
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    self.nav_keys.apply(preset);
+                    self.nav_keys.save();
+                    self.rebinding = None;
+                    self.rebind_rejected = None;
+                }
+            }
+            if Pill::new("Clear")
+                .style(PillStyle::Quiet)
+                .small()
+                .show(ui)
+                .clicked()
+            {
+                self.nav_keys.clear();
+                self.nav_keys.save();
+                self.rebinding = None;
+                self.rebind_rejected = None;
+            }
+        });
+
+        if self.rebinding.is_some() {
+            ui.label(
+                egui::RichText::new("Press any key, or Escape to cancel.")
+                    .color(theme::text_faint())
+                    .size(10.5),
+            );
+        } else if let Some(key) = self.rebind_rejected {
+            ui.label(
+                egui::RichText::new(format!("{} is always bound — pick another.", key.name()))
+                    .color(egui::Color32::from_rgb(224, 170, 110))
+                    .size(10.5),
+            );
+        }
     }
 }
 
