@@ -145,6 +145,9 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// fixed 330px wide and shares that space with the Open button and the
 /// current document's details; more than this and the menu stops being
 /// something you can read at a glance.
+/// How long the lone page capsule takes to leave. Shorter than the
+/// bar's own fade so it is out of the way before the bar is fully there.
+const PAGE_PILL_FADE: f32 = 0.09;
 /// Starting zoom. Pages render at 1.5x by default; for Markdown this is
 /// the divisor that turns the same number into a type-size multiplier,
 /// so the reader opens at the base font size.
@@ -436,9 +439,6 @@ struct SenpaiApp {
 
     /// When the current render request started, for `RENDER_HINT_DELAY`.
     render_started: Option<f64>,
-    /// Page the counter pill last showed, so it can re-fade on a change.
-    last_shown_page: usize,
-    page_pill_until: f64,
 }
 
 /// Whether a pointer press should close the open menu.
@@ -515,8 +515,6 @@ impl SenpaiApp {
             md_scroll: 0.0,
             drop_label: None,
             render_started: None,
-            last_shown_page: 0,
-            page_pill_until: 0.0,
         };
         theme::install(&cc.egui_ctx, app.dark_mode);
         if let Some(path) = initial_path {
@@ -714,9 +712,6 @@ impl SenpaiApp {
         self.page_count = page_count;
         self.doc_path = Some(path.to_path_buf());
         self.current_page = 0;
-        // Forces the counter pill to flash once on open, so the page
-        // count is visible without having to turn a page first.
-        self.last_shown_page = usize::MAX;
         self.estimated_page_size = estimated_page_size;
         self.known_page_heights = vec![None; page_count];
         self.next_generation = 0;
@@ -1109,6 +1104,7 @@ impl eframe::App for SenpaiApp {
 
         self.show_status_pills(ctx);
         self.show_top_bar(ctx, bar_t);
+        self.show_page_counter(ctx, bar_t);
     }
 }
 
@@ -1155,24 +1151,42 @@ impl SenpaiApp {
             hint_t,
             "rendering…",
         );
+    }
 
-        if self.current_page != self.last_shown_page {
-            self.last_shown_page = self.current_page;
-            self.page_pill_until = now + 1.4;
+    /// The page counter, in the one place the eye is already going to
+    /// look for controls.
+    ///
+    /// It used to be a capsule at the bottom of the window that flashed
+    /// for a second and a half after each turn. That put the one number
+    /// a reader checks constantly in the one corner nothing else lives
+    /// in, and made it a thing you had to catch rather than consult.
+    ///
+    /// Now it sits where the bar sits. With the bar hidden it is a
+    /// capsule of its own; hover the top of the window and the bar
+    /// arrives around it, with the number unmoved. The backgrounds
+    /// cross-fade, the number itself does not -- it is continuously
+    /// readable through the whole transition, which is the point.
+    fn show_page_counter(&mut self, ctx: &egui::Context, bar_t: f32) {
+        if self.page_count == 0 {
+            return;
         }
-        let page_visible = now < self.page_pill_until;
-        if page_visible {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.1));
-        }
-        let page_t =
-            ctx.animate_bool_with_time(egui::Id::new("page_pill"), page_visible, theme::T_PANEL);
-        theme::status_pill(
+        // Faster out than the bar is in, so the lone capsule is clearly
+        // leaving rather than competing with what replaces it.
+        let alone_t =
+            ctx.animate_bool_with_time(egui::Id::new("page_alone"), bar_t <= 0.001, PAGE_PILL_FADE);
+        let text_t = bar_t.max(alone_t);
+        // The capsule is held back while the bar has any presence at
+        // all, so the two surfaces are never both solid at once.
+        let frame_t = alone_t * (1.0 - bar_t);
+        // Tracks the bar's own travel, so during a transition the number
+        // moves with the surface arriving under it.
+        let slide = 2.0 + 10.0 * egui::emath::easing::cubic_out(text_t);
+        theme::page_counter(
             ctx,
-            "page_counter_pill",
-            egui::Align2::CENTER_BOTTOM,
-            egui::vec2(0.0, -16.0),
-            page_t,
+            slide,
             &format!("{} / {}", self.current_page + 1, self.page_count),
+            text_t,
+            frame_t,
         );
     }
 

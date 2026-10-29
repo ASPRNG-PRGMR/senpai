@@ -28,6 +28,10 @@ pub const R_CARD: f32 = 14.0;
 /// so the inner and outer curves stay concentric.
 pub const R_TRACK: f32 = 18.0;
 
+/// Height of a [`Pill`], and so of anything that has to line up with the
+/// row of them in the top bar.
+pub const PILL_HEIGHT: f32 = 30.0;
+
 // ── Durations (seconds) ──────────────────────────────────────────────────
 //
 // Long enough to read as motion, short enough never to sit between the
@@ -274,7 +278,7 @@ impl<'a> Pill<'a> {
 
         let desired = vec2(
             (text_w + 32.0).max(self.min_width),
-            (self.font_size + 17.0).max(30.0),
+            (self.font_size + 17.0).max(PILL_HEIGHT),
         );
         let sense = if self.enabled {
             Sense::click()
@@ -629,6 +633,62 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
             Color32::WHITE,
         );
     }
+}
+
+// ── Page counter ─────────────────────────────────────────────────────────
+
+/// The page counter, drawn at one fixed position whether it is sitting
+/// alone at the top of the window or inside the top bar.
+///
+/// The number never moves. Only what is behind it changes: with the bar
+/// hidden it gets a capsule of its own, and when the bar comes up that
+/// capsule dissolves while the bar's own surface takes its place under
+/// the same glyphs. Two separate widgets swapping over would have to be
+/// aligned by hand and would drift the moment either one's padding
+/// changed, so there is one widget and two backgrounds.
+///
+/// Geometry is tied to the bar's: the same centre-top anchor, the same
+/// 7px vertical margin, and a content box of exactly [`PILL_HEIGHT`],
+/// which is what the bar's own buttons stand at. That makes the capsule
+/// the same height as the bar by construction rather than by a matching
+/// pair of constants.
+pub fn page_counter(ctx: &egui::Context, offset_y: f32, text: &str, text_t: f32, frame_t: f32) {
+    if text_t <= 0.001 {
+        return;
+    }
+    egui::Area::new(egui::Id::new("page_counter"))
+        .anchor(Align2::CENTER_TOP, vec2(0.0, offset_y))
+        .order(egui::Order::Foreground)
+        // Never takes a click: it is a readout, and swallowing presses
+        // here would punch a hole in the middle of the bar.
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(CHROME.gamma_multiply(frame_t))
+                .rounding(Rounding::same(R_PILL))
+                .stroke(Stroke::new(1.0_f32, HAIRLINE.gamma_multiply(frame_t)))
+                .shadow(soft_shadow(frame_t))
+                .inner_margin(egui::Margin::symmetric(14.0, 7.0))
+                .show(ui, |ui| {
+                    let font = egui::FontId::proportional(11.5);
+                    // Sized to the text, so a four-digit page count gets
+                    // the room it needs and a single-digit one does not
+                    // leave a gap. One line either side of the slash.
+                    let width = ui
+                        .fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE))
+                        .size()
+                        .x;
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::hover());
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        text,
+                        font,
+                        TEXT_DIM.gamma_multiply(text_t),
+                    );
+                });
+        });
 }
 
 #[cfg(test)]
