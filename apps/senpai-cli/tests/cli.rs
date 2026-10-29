@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// A one-page, blank PDF with a correct xref table. Smaller than the
 /// fixture in `senpai-pdf-poppler`'s tests because nothing here needs
@@ -40,21 +41,52 @@ fn blank_pdf() -> Vec<u8> {
     out
 }
 
+/// The fixture on disk, written exactly once however many tests ask for
+/// it.
+///
+/// It used to be written afresh by every caller, to one shared path.
+/// Tests are threads, `fs::write` truncates before it writes, and each
+/// caller handed the path straight to a subprocess -- so one test could
+/// open the file during another's truncate and find it empty. The
+/// symptom was a single test failing on CI, never here, with no output
+/// to say why: the reader had reported a broken PDF on stderr, which
+/// the harness was throwing away.
+///
+/// `OnceLock` makes the write happen once; the process id keeps two
+/// concurrent `cargo test` runs off each other's file.
 fn fixture() -> PathBuf {
-    let path = std::env::temp_dir().join("senpai-cli-test.pdf");
-    std::fs::write(&path, blank_pdf()).expect("write fixture");
-    path
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = temp_path("pdf");
+        std::fs::write(&path, blank_pdf()).expect("write fixture");
+        path
+    })
+    .clone()
 }
 
+/// A scratch path of our own, not shared with another test run.
+fn temp_path(ext: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("senpai-cli-test-{}.{ext}", std::process::id()))
+}
+
+/// Runs the binary and returns its output, stderr included.
+///
+/// Included because leaving it out cost an afternoon: a failing test
+/// printed `bench failed:` and nothing else, while the reason -- the
+/// reader's own complaint about the file it had been given -- went to
+/// stderr and was dropped. A test that fails without saying why is
+/// barely better than one that does not run.
 fn run(args: &[&str]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_senpai"))
         .args(args)
         .output()
         .expect("run senpai");
-    (
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    )
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.stderr.is_empty() {
+        text.push_str("\n--- stderr ---\n");
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
+    (out.status.success(), text)
 }
 
 #[test]
@@ -114,7 +146,7 @@ fn bench_rejects_a_missing_path() {
 #[test]
 fn render_writes_a_ppm() {
     let pdf = fixture();
-    let out = std::env::temp_dir().join("senpai-cli-test.ppm");
+    let out = temp_path("ppm");
     let _ = std::fs::remove_file(&out);
     let (ok, stdout) = run(&[
         "render",
