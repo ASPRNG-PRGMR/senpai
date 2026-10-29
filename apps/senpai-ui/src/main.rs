@@ -1613,7 +1613,7 @@ impl SenpaiApp {
                                                 zoom_percent(self.scale)
                                             ))
                                             .color(theme::TEXT_FAINT)
-                                            .size(11.5),
+                                            .size(theme::COUNTER_FONT - 1.0),
                                         );
                                     }
                                 },

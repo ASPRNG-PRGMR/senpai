@@ -29,8 +29,19 @@ pub const R_CARD: f32 = 14.0;
 pub const R_TRACK: f32 = 18.0;
 
 /// Height of a [`Pill`], and so of anything that has to line up with the
-/// row of them in the top bar.
-pub const PILL_HEIGHT: f32 = 30.0;
+/// row of them in the top bar. Tied to [`BAR_FONT`]: a pill is its label
+/// plus padding, and the two have to move together or the capsule stops
+/// matching the bar it sits in.
+pub const PILL_HEIGHT: f32 = BAR_FONT + 18.0;
+
+/// Type size for the top bar's buttons, and the floor for the readouts
+/// beside them.
+pub const BAR_FONT: f32 = 14.5;
+
+/// Type size for the page counter. A step under the buttons -- it is a
+/// readout, not a control -- but close enough to be read at a glance
+/// from across the window, which at 11.5 it was not.
+pub const COUNTER_FONT: f32 = 13.0;
 
 // ── Durations (seconds) ──────────────────────────────────────────────────
 //
@@ -222,7 +233,7 @@ impl<'a> Pill<'a> {
             style: PillStyle::Ghost,
             enabled: true,
             min_width: 0.0,
-            font_size: 13.0,
+            font_size: BAR_FONT,
             align_left: false,
         }
     }
@@ -254,7 +265,7 @@ impl<'a> Pill<'a> {
     }
 
     pub fn small(mut self) -> Self {
-        self.font_size = 11.5;
+        self.font_size = 12.0;
         self
     }
 
@@ -670,7 +681,7 @@ pub fn page_counter(ctx: &egui::Context, offset_y: f32, text: &str, text_t: f32,
                 .shadow(soft_shadow(frame_t))
                 .inner_margin(egui::Margin::symmetric(14.0, 7.0))
                 .show(ui, |ui| {
-                    let font = egui::FontId::proportional(11.5);
+                    let font = egui::FontId::proportional(COUNTER_FONT);
                     // Sized to the text, so a four-digit page count gets
                     // the room it needs and a single-digit one does not
                     // leave a gap. One line either side of the slash.
