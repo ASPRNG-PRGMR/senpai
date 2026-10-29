@@ -148,6 +148,9 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// How long the lone page capsule takes to leave. Shorter than the
 /// bar's own fade so it is out of the way before the bar is fully there.
 const PAGE_PILL_FADE: f32 = 0.09;
+/// How long the lone capsule stays up after a page turn. Long enough to
+/// read a four-digit number, short enough not to become scenery.
+const PAGE_FLASH: f64 = 1.4;
 /// Starting zoom. Pages render at 1.5x by default; for Markdown this is
 /// the divisor that turns the same number into a type-size multiplier,
 /// so the reader opens at the base font size.
@@ -439,6 +442,11 @@ struct SenpaiApp {
 
     /// When the current render request started, for `RENDER_HINT_DELAY`.
     render_started: Option<f64>,
+    /// Page the counter last reported, so a turn can be noticed.
+    last_shown_page: usize,
+    /// When the lone capsule should stop being shown. Only meaningful
+    /// while the bar is hidden; with the bar up the number is in it.
+    page_flash_until: f64,
 }
 
 /// Whether a pointer press should close the open menu.
@@ -515,6 +523,8 @@ impl SenpaiApp {
             md_scroll: 0.0,
             drop_label: None,
             render_started: None,
+            last_shown_page: 0,
+            page_flash_until: 0.0,
         };
         theme::install(&cc.egui_ctx, app.dark_mode);
         if let Some(path) = initial_path {
@@ -714,6 +724,9 @@ impl SenpaiApp {
         self.current_page = 0;
         self.estimated_page_size = estimated_page_size;
         self.known_page_heights = vec![None; page_count];
+        // Flashes the count once on open, so how long the document is
+        // can be seen without having to turn a page to find out.
+        self.last_shown_page = usize::MAX;
         self.next_generation = 0;
         self.requested_primary = None;
         self.render_pending = false;
@@ -1156,24 +1169,47 @@ impl SenpaiApp {
     /// The page counter, in the one place the eye is already going to
     /// look for controls.
     ///
-    /// It used to be a capsule at the bottom of the window that flashed
-    /// for a second and a half after each turn. That put the one number
-    /// a reader checks constantly in the one corner nothing else lives
-    /// in, and made it a thing you had to catch rather than consult.
+    /// It used to be a capsule at the bottom of the window. That put the
+    /// one number a reader checks constantly in the corner nothing else
+    /// lives in, so it moved up here, where the controls already are.
     ///
-    /// Now it sits where the bar sits. With the bar hidden it is a
-    /// capsule of its own; hover the top of the window and the bar
-    /// arrives around it, with the number unmoved. The backgrounds
-    /// cross-fade, the number itself does not -- it is continuously
-    /// readable through the whole transition, which is the point.
+    /// Which of its two forms it takes depends on the bar, and on
+    /// whether anything just happened:
+    ///
+    /// - bar up: part of the bar, always. The bar is already on screen,
+    ///   and a readout costs nothing once it is;
+    /// - bar hidden, a page just turned: a capsule of its own, which
+    ///   leaves again after [`PAGE_FLASH`];
+    /// - bar hidden, nothing happening: nothing at all. Someone reading
+    ///   a page should be looking at the page, not at a number that has
+    ///   not changed since they last looked.
+    ///
+    /// Hovering the top swaps the capsule for the bar with the number
+    /// unmoved: the backgrounds cross-fade, the glyphs do not.
     fn show_page_counter(&mut self, ctx: &egui::Context, bar_t: f32) {
         if self.page_count == 0 {
             return;
         }
+        let now = ctx.input(|i| i.time);
+        if self.current_page != self.last_shown_page {
+            self.last_shown_page = self.current_page;
+            self.page_flash_until = now + PAGE_FLASH;
+        }
+        let flashing = now < self.page_flash_until;
+        if flashing {
+            // Nothing else is necessarily animating while a page is just
+            // sitting there, and without this the frame that retires the
+            // capsule never arrives -- it would stay up until some
+            // unrelated repaint happened to come along.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.1));
+        }
         // Faster out than the bar is in, so the lone capsule is clearly
         // leaving rather than competing with what replaces it.
-        let alone_t =
-            ctx.animate_bool_with_time(egui::Id::new("page_alone"), bar_t <= 0.001, PAGE_PILL_FADE);
+        let alone_t = ctx.animate_bool_with_time(
+            egui::Id::new("page_alone"),
+            bar_t <= 0.001 && flashing,
+            PAGE_PILL_FADE,
+        );
         let text_t = bar_t.max(alone_t);
         // The capsule is held back while the bar has any presence at
         // all, so the two surfaces are never both solid at once.
