@@ -201,10 +201,19 @@ fn zoom_percent(scale: f64) -> u32 {
 /// How long the lone capsule stays up after a page turn. Long enough to
 /// read a four-digit number, short enough not to become scenery.
 const PAGE_FLASH: f64 = 1.4;
-/// Starting zoom. Pages render at 1.5x by default; for Markdown this is
-/// the divisor that turns the same number into a type-size multiplier,
-/// so the reader opens at the base font size.
-const DEFAULT_SCALE: f64 = 1.5;
+/// Starting zoom, and the 100% the bar reports.
+///
+/// 1.8 rather than 1.5: a page opened at the old default wanted one
+/// press of `+` before it was comfortable to read, which is a poor place
+/// to call 100%. The step the keys take is 1.2, so this is exactly that
+/// one press -- what used to read 120% is now where a document starts.
+///
+/// It does both jobs, which is what keeps them consistent: pages render
+/// at this scale, and for text it is the divisor that turns the same
+/// number into a type-size multiplier. Moving it therefore opens PDFs
+/// larger while leaving text exactly where it was, since text is sized
+/// relative to this and both halves moved together.
+const DEFAULT_SCALE: f64 = 1.8;
 const RECENT_IN_MENU: usize = 6;
 /// Budget for an entry's label, in characters. The dropdown's pills do
 /// not wrap or truncate on their own -- a long name would simply push
