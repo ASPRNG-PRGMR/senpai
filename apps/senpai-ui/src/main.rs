@@ -148,6 +148,23 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// How long the lone page capsule takes to leave. Shorter than the
 /// bar's own fade so it is out of the way before the bar is fully there.
 const PAGE_PILL_FADE: f32 = 0.09;
+/// Settles who owns the zoom shortcuts.
+///
+/// egui binds Ctrl +, Ctrl = and Ctrl - to a zoom of its own -- the
+/// whole interface, chrome included -- and has it on by default. The
+/// reader's `+` and `-` are checked without looking at modifiers, so
+/// Ctrl and a plus key was firing both at once: the document scaled and
+/// the top bar grew with it. Two zooms answering one key is not a
+/// feature, it is a collision, and the one that should win is obvious.
+/// A reader zooms the thing being read.
+///
+/// So egui's is turned off and Ctrl + / Ctrl - fall through to the
+/// document, the same as the bare keys. The bar now stays the size it
+/// was drawn at.
+fn configure_context(ctx: &egui::Context) {
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
+}
+
 /// The zoom level as a percentage, where the level a document opens at
 /// is 100%.
 ///
@@ -538,6 +555,7 @@ impl SenpaiApp {
             last_shown_page: 0,
             page_flash_until: 0.0,
         };
+        configure_context(&cc.egui_ctx);
         theme::install(&cc.egui_ctx, app.dark_mode);
         if let Some(path) = initial_path {
             app.open_document(&cc.egui_ctx, &path);
@@ -1007,6 +1025,10 @@ impl eframe::App for SenpaiApp {
                 (
                     i.key_pressed(self.nav_keys.next) || i.key_pressed(egui::Key::Space),
                     i.key_pressed(self.nav_keys.prev),
+                    // Modifiers deliberately unchecked: Ctrl and a plus
+                    // key means the same thing here as the plus key on
+                    // its own, now that egui is not also listening for
+                    // it. See `configure_context`.
                     i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
                     i.key_pressed(egui::Key::Minus),
                 )
@@ -1818,10 +1840,10 @@ impl SenpaiApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        elide, is_markdown, pick_dropped_document, should_dismiss_menu, zoom_percent,
-        DEFAULT_SCALE, RECENT_NAME_CHARS,
+        configure_context, elide, is_markdown, pick_dropped_document, should_dismiss_menu,
+        zoom_percent, DEFAULT_SCALE, RECENT_NAME_CHARS,
     };
-    use eframe::egui::{pos2, Rect};
+    use eframe::egui::{self, pos2, Rect};
     use std::path::{Path, PathBuf};
 
     fn bar() -> Rect {
@@ -1966,6 +1988,20 @@ mod tests {
             pick_dropped_document(&dropped),
             Some(Path::new("/README.md"))
         );
+    }
+
+    /// Pins the collision this removed: egui ships a whole-interface
+    /// zoom on the same keys, so Ctrl and a plus key scaled the document
+    /// *and* grew the top bar around it.
+    #[test]
+    fn egui_s_own_zoom_shortcuts_are_handed_over_to_the_document() {
+        let ctx = egui::Context::default();
+        assert!(
+            ctx.options(|o| o.zoom_with_keyboard),
+            "egui has this on by default -- if that changes, so does the reason for this"
+        );
+        configure_context(&ctx);
+        assert!(!ctx.options(|o| o.zoom_with_keyboard));
     }
 
     #[test]
