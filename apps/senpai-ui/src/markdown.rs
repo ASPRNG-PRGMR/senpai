@@ -635,14 +635,17 @@ pub fn plain(spans: &[Span]) -> String {
 
 // ── Rendering ────────────────────────────────────────────────────────────
 
-/// Unzoomed width of the reading column, in points.
+/// Space kept between the text and each window edge.
 ///
-/// Text is not set to the window's full width on purpose: a line that
-/// runs the width of a maximised window is measurably harder to read,
-/// because the eye loses its place on the return sweep. This is roughly
-/// 90 characters at the base size, at the wide end of the usual advice
-/// and chosen so code blocks and tables are not cramped by it.
-const COLUMN_PT: f32 = 760.0;
+/// Fixed, not scaled by zoom: this is a margin on the window, not a
+/// measure of the type, and scaling it meant that at large sizes the
+/// margins ate the window.
+const SIDE_MARGIN: f32 = 28.0;
+
+/// Narrower than this and the margins are doing more harm than good, so
+/// a very small window gives them up rather than squeezing the text into
+/// a ribbon.
+const MIN_COLUMN: f32 = 180.0;
 
 /// Body text size at zoom 1.0.
 const BASE_FONT: f32 = 15.0;
@@ -1004,9 +1007,19 @@ fn space_before(block: &Block, first: bool) -> f32 {
 
 /// The width the reading column should take inside `available`.
 ///
-/// Split out so the clamping rule can be checked without a window.
-pub fn column_width(available: f32, zoom: f32) -> f32 {
-    (COLUMN_PT * zoom).min(available)
+/// The column follows the window and nothing else. It used to be capped
+/// at a fixed measure in points scaled by zoom, which meant that past a
+/// certain zoom the column was wider than the window it had to fit in:
+/// the text then ran flush to both edges and was clipped on the right.
+/// A width computed from the type size cannot know how much room there
+/// is, so it is the window that decides, and zoom only changes how large
+/// the type is within it.
+///
+/// Split out from the view so the rule can be checked without a window.
+pub fn column_width(available: f32) -> f32 {
+    // `min(available)` in the floor as well: on a window narrower than
+    // the minimum, giving up the margins is right, overflowing it is not.
+    (available - 2.0 * SIDE_MARGIN).max(MIN_COLUMN.min(available))
 }
 
 #[cfg(test)]
@@ -1377,13 +1390,31 @@ mod tests {
         assert_eq!(links, vec!["https://real.example"]);
     }
 
+    /// The bug this pins: at a large enough zoom the old rule returned a
+    /// column wider than the window, so the text ran flush to both edges
+    /// and was clipped on the right.
     #[test]
-    fn the_reading_column_is_capped_but_never_exceeds_the_window() {
-        // Narrow window: the column gives way.
-        assert_eq!(column_width(400.0, 1.0), 400.0);
-        // Wide window: the column holds its measure.
-        assert_eq!(column_width(2000.0, 1.0), COLUMN_PT);
-        // Zoom widens it, since the type grew too.
-        assert_eq!(column_width(4000.0, 2.0), COLUMN_PT * 2.0);
+    fn the_column_always_leaves_a_margin_inside_the_window() {
+        for available in [400.0, 1000.0, 2000.0, 4000.0] {
+            let w = column_width(available);
+            assert!(
+                w <= available - 2.0 * SIDE_MARGIN,
+                "{w} should fit inside {available} with margins"
+            );
+        }
+    }
+
+    #[test]
+    fn the_column_tracks_the_window_rather_than_a_measure_of_its_own() {
+        // Twice the room, twice the column, less the fixed margins.
+        let narrow = column_width(1000.0);
+        let wide = column_width(2000.0);
+        assert_eq!(wide - narrow, 1000.0);
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_margins_gives_them_up_rather_than_overflowing() {
+        // 100px of window: the margins would leave 44px of text.
+        assert_eq!(column_width(100.0), 100.0);
     }
 }

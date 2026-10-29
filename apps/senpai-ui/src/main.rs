@@ -1268,9 +1268,13 @@ impl SenpaiApp {
             .frame(egui::Frame::none().fill(bg))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let width = markdown::column_width(ui.available_width(), zoom);
+                    let width = markdown::column_width(ui.available_width());
                     let gutter = ((ui.available_width() - width) / 2.0).max(0.0);
                     ui.horizontal_top(|ui| {
+                        // Zeroed, or egui inserts its default item gap
+                        // between the spacer and the column and pushes
+                        // the text that far past the right edge.
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         ui.add_space(gutter);
                         ui.vertical(|ui| {
                             ui.set_width(width);
