@@ -148,6 +148,18 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// How long the lone page capsule takes to leave. Shorter than the
 /// bar's own fade so it is out of the way before the bar is fully there.
 const PAGE_PILL_FADE: f32 = 0.09;
+/// The zoom level as a percentage, where the level a document opens at
+/// is 100%.
+///
+/// `scale` is a renderer figure -- the multiplier handed to poppler,
+/// 1.0 being 72 DPI -- and means nothing to a reader. What a reader
+/// wants to know is how far from "as opened" they have got, which is
+/// what this reports. A free function rather than a method so the
+/// arithmetic can be checked without an app.
+fn zoom_percent(scale: f64) -> u32 {
+    (scale / DEFAULT_SCALE * 100.0).round() as u32
+}
+
 /// How long the lone capsule stays up after a page turn. Long enough to
 /// read a four-digit number, short enough not to become scenery.
 const PAGE_FLASH: f64 = 1.4;
@@ -1487,6 +1499,24 @@ impl SenpaiApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     self.menu_button(ui, "Options", Menu::Options);
+                                    // Right-hand end, beside Options: a
+                                    // readout rather than a control, so
+                                    // it sits quieter than the buttons
+                                    // and well clear of the page counter
+                                    // in the middle. Hidden with no
+                                    // document, where it would be
+                                    // reporting on nothing.
+                                    if self.has_document() {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}%",
+                                                zoom_percent(self.scale)
+                                            ))
+                                            .color(theme::TEXT_FAINT)
+                                            .size(11.5),
+                                        );
+                                    }
                                 },
                             );
                         });
@@ -1788,7 +1818,8 @@ impl SenpaiApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        elide, is_markdown, pick_dropped_document, should_dismiss_menu, RECENT_NAME_CHARS,
+        elide, is_markdown, pick_dropped_document, should_dismiss_menu, zoom_percent,
+        DEFAULT_SCALE, RECENT_NAME_CHARS,
     };
     use eframe::egui::{pos2, Rect};
     use std::path::{Path, PathBuf};
@@ -1935,6 +1966,20 @@ mod tests {
             pick_dropped_document(&dropped),
             Some(Path::new("/README.md"))
         );
+    }
+
+    #[test]
+    fn a_freshly_opened_document_reads_as_one_hundred_percent() {
+        assert_eq!(zoom_percent(DEFAULT_SCALE), 100);
+    }
+
+    #[test]
+    fn zoom_is_reported_relative_to_that_rather_than_as_the_raw_scale() {
+        assert_eq!(zoom_percent(DEFAULT_SCALE * 2.0), 200);
+        assert_eq!(zoom_percent(DEFAULT_SCALE * 0.5), 50);
+        // The 1.2x step the zoom keys take, rounded to whole percent.
+        assert_eq!(zoom_percent(DEFAULT_SCALE * 1.2), 120);
+        assert_eq!(zoom_percent(DEFAULT_SCALE * 1.2 * 1.2), 144);
     }
 
     #[test]
