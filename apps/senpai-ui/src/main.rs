@@ -1245,6 +1245,7 @@ impl SenpaiApp {
     /// pipeline the rest of the reader is built on.
     fn show_markdown_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
         let zoom = (self.scale / DEFAULT_SCALE) as f32;
+        let dark = self.dark_mode;
         let scroll = std::mem::take(&mut self.md_scroll);
         let Some(doc) = &self.markdown else {
             return;
@@ -1260,7 +1261,7 @@ impl SenpaiApp {
                         ui.vertical(|ui| {
                             ui.set_width(width);
                             ui.add_space(30.0 * zoom);
-                            markdown::show(ui, doc, zoom);
+                            markdown::show(ui, doc, zoom, dark);
                             // Room to scroll the last line clear of the
                             // bottom edge, the way a page has a margin.
                             ui.add_space(60.0 * zoom);

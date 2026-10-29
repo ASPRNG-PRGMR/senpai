@@ -466,8 +466,14 @@ fn palette(dark: bool) -> Palette {
 /// `zoom` multiplies every size, so the reader's existing zoom keys mean
 /// "bigger type" here rather than "more pixels per page" -- the same
 /// gesture, the right behaviour for a reflowing format.
-pub fn show(ui: &mut egui::Ui, doc: &Document, zoom: f32) {
-    let pal = palette(ui.visuals().dark_mode);
+///
+/// `dark` is passed in rather than read back out of `ui.visuals()`: the
+/// app's own Light/Night switch is the only thing that decides this, and
+/// asking egui instead meant asking a second source that can disagree --
+/// which it did, on every frame before the theme was pinned in
+/// `theme::install`.
+pub fn show(ui: &mut egui::Ui, doc: &Document, zoom: f32, dark: bool) {
+    let pal = palette(dark);
     let base = BASE_FONT * zoom;
     // `space_before` is the only thing that decides vertical rhythm.
     // Leaving egui's default row spacing on top of it pushed list items

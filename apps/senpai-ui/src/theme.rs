@@ -88,6 +88,29 @@ fn contact_shadow(strength: f32) -> Shadow {
 /// Installs the base style. Called on startup and whenever the theme
 /// flips, since `Visuals` carries the light/dark decision.
 pub fn install(ctx: &egui::Context, dark: bool) {
+    // Pin the preference before touching visuals, and it must be both:
+    //
+    // egui keeps a separate style per theme and serves whichever one
+    // `Context::theme()` names. Left at its default that is the *system*
+    // theme, so `set_visuals` writes into whichever slot happens to be
+    // current at startup -- the Dark fallback, before the OS has been
+    // heard from -- and the moment a Light system theme arrives egui
+    // switches to the untouched Light slot. Under Wine that happened on
+    // frame 0: `theme()` was Light while the app's own toggle said dark,
+    // so anything reading `visuals()` got a stock light palette and
+    // painted black text onto the dark background. Toggling the switch
+    // wrote into the now-current slot, which is why it then fixed
+    // itself.
+    //
+    // The app owns this choice, not the desktop: it has a Light/Night
+    // switch of its own, and a reader that repaints itself because the
+    // OS changed its mind is not doing what was asked.
+    ctx.set_theme(if dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
+
     let mut visuals = if dark {
         egui::Visuals::dark()
     } else {
@@ -605,5 +628,38 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
             sub,
             Color32::WHITE,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Theme, ThemePreference};
+
+    /// Pins the bug behind v0.2.1: egui keeps one style per theme and
+    /// serves whichever `Context::theme()` names. Left on the system
+    /// preference, a desktop reporting the opposite theme -- Wine
+    /// reports Light on frame 0 -- served a stock palette while the
+    /// app's own switch said otherwise, which painted black Markdown
+    /// text onto the dark background until the switch was toggled.
+    #[test]
+    fn install_overrides_whatever_the_desktop_asked_for() {
+        for (dark, want) in [(true, Theme::Dark), (false, Theme::Light)] {
+            let ctx = egui::Context::default();
+            // Stand in for a desktop insisting on the opposite theme.
+            ctx.options_mut(|o| {
+                o.theme_preference = ThemePreference::System;
+                o.fallback_theme = if dark { Theme::Light } else { Theme::Dark };
+            });
+
+            install(&ctx, dark);
+
+            assert_eq!(ctx.theme(), want, "install(dark={dark}) must pin the theme");
+            assert_eq!(
+                ctx.style().visuals.dark_mode,
+                dark,
+                "the style actually served must be the one install wrote"
+            );
+        }
     }
 }
