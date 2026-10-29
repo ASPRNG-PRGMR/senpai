@@ -1589,7 +1589,11 @@ impl SenpaiApp {
         }
 
         let screen_width = ctx.screen_rect().width();
-        let bar_width = (screen_width - 80.0).clamp(280.0, 900.0);
+        // Narrower than the window by a clear margin, and capped well
+        // short of a wide monitor: a bar that runs most of the way
+        // across reads as a toolbar, and the whole point of this one is
+        // that it does not.
+        let bar_width = (screen_width - 140.0).clamp(300.0, 720.0);
 
         // Slides down into place as it fades. A few pixels of travel is
         // what separates "appeared" from "arrived". Note the direction:
@@ -1604,9 +1608,12 @@ impl SenpaiApp {
                 ui.set_opacity(fade);
                 ui.set_width(bar_width);
                 theme::chrome_frame(theme::R_PILL)
-                    .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                    .inner_margin(egui::Margin::symmetric(
+                        theme::BAR_MARGIN_X,
+                        theme::BAR_MARGIN_Y,
+                    ))
                     .show(ui, |ui| {
-                        ui.set_width(bar_width - 20.0);
+                        ui.set_width(bar_width - 2.0 * theme::BAR_MARGIN_X);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             self.menu_button(ui, "Files", Menu::Files);

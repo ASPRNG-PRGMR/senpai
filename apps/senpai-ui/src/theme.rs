@@ -32,16 +32,24 @@ pub const R_TRACK: f32 = 18.0;
 /// row of them in the top bar. Tied to [`BAR_FONT`]: a pill is its label
 /// plus padding, and the two have to move together or the capsule stops
 /// matching the bar it sits in.
-pub const PILL_HEIGHT: f32 = BAR_FONT + 18.0;
+pub const PILL_HEIGHT: f32 = BAR_FONT + 12.0;
 
 /// Type size for the top bar's buttons, and the floor for the readouts
 /// beside them.
-pub const BAR_FONT: f32 = 14.5;
+pub const BAR_FONT: f32 = 16.5;
 
 /// Type size for the page counter. A step under the buttons -- it is a
 /// readout, not a control -- but close enough to be read at a glance
-/// from across the window, which at 11.5 it was not.
-pub const COUNTER_FONT: f32 = 13.0;
+/// from across the window.
+pub const COUNTER_FONT: f32 = 15.0;
+
+/// Vertical space between the bar's surface and the row of pills inside
+/// it. Shared with the page capsule, which is why it is a constant: the
+/// two are the same height only while they agree on this.
+pub const BAR_MARGIN_Y: f32 = 5.0;
+/// Horizontal counterpart. Wider than the vertical, because a capsule's
+/// rounded ends eat into the horizontal room and not the vertical.
+pub const BAR_MARGIN_X: f32 = 9.0;
 
 // ── Durations (seconds) ──────────────────────────────────────────────────
 //
@@ -287,9 +295,13 @@ impl<'a> Pill<'a> {
             .size()
             .x;
 
+        // Padding kept tight on purpose: a pill is a label with enough
+        // room to be pressed, not a slab with a label in it. The height
+        // floor is what lines every pill in the bar up with its
+        // neighbours whatever size their text is.
         let desired = vec2(
-            (text_w + 32.0).max(self.min_width),
-            (self.font_size + 17.0).max(PILL_HEIGHT),
+            (text_w + 24.0).max(self.min_width),
+            (self.font_size + 11.0).max(PILL_HEIGHT),
         );
         let sense = if self.enabled {
             Sense::click()
@@ -673,9 +685,9 @@ pub fn counter_label(ui: &mut egui::Ui, text: &str, slot_w: f32) {
 /// controls, the other is the only thing on screen -- and the lone one
 /// belongs in the middle, where nothing else is competing for the eye.
 ///
-/// Its height is the bar's by construction: the same 7px margin around a
-/// content box of exactly [`PILL_HEIGHT`], which is what the bar's own
-/// buttons stand at.
+/// Its height is the bar's by construction: the same [`BAR_MARGIN_Y`]
+/// around a content box of exactly [`PILL_HEIGHT`], which is what the
+/// bar's own buttons stand at.
 ///
 /// Painted above `Order::Foreground`, because egui raises a layer to the
 /// top when it is clicked and sharing an order with the bar meant a
@@ -693,7 +705,7 @@ pub fn page_capsule(ctx: &egui::Context, offset_y: f32, text: &str, t: f32) {
         .show(ctx, |ui| {
             ui.set_opacity(t);
             chrome_frame(R_PILL)
-                .inner_margin(egui::Margin::symmetric(14.0, 7.0))
+                .inner_margin(egui::Margin::symmetric(14.0, BAR_MARGIN_Y))
                 .show(ui, |ui| {
                     let font = egui::FontId::proportional(COUNTER_FONT);
                     // Sized to the text: a four-digit count gets the room
