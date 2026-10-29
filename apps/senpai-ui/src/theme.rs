@@ -16,6 +16,7 @@
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Rect, Response, Rounding, Sense, Stroke};
 use egui::epaint::Shadow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Radii ────────────────────────────────────────────────────────────────
 //
@@ -63,27 +64,117 @@ pub const T_PANEL: f32 = 0.17;
 
 // ── Palette ──────────────────────────────────────────────────────────────
 //
-// The chrome is black-on-translucent in both themes, matching the top bar
-// the rest of the UI hangs off, so these are fixed rather than
-// theme-dependent. Written premultiplied (r=g=b=a is opaque white laid
-// over the backdrop at a/255) because that form is const-constructible.
+// Both themes, inverted. The chrome used to be black-on-translucent
+// whatever the mode, on the reasoning that the bar is the bar; but a
+// white page under a black bar is two different documents' worth of
+// contrast at the top of the window, and Light mode was only ever half
+// applied while that was true.
+//
+// So the palette runs one way or the other and everything else is
+// expressed against it: `veil` is a wash of the foreground colour, which
+// is white over a dark chrome and black over a light one, so a hover
+// highlight brightens in the dark and darkens in the light without any
+// call site knowing which it is.
+//
+// Written premultiplied (r=g=b=a is opaque white laid over the backdrop
+// at a/255) because that form is const-constructible.
+
+/// Which way the palette runs. Set by [`install`], and deliberately the
+/// only place it is decided -- the same reasoning as pinning egui's
+/// theme preference there: asking a second source produced a window
+/// whose chrome and whose text disagreed about the mode.
+static DARK: AtomicBool = AtomicBool::new(true);
+
+fn is_dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+fn pick(dark: Color32, light: Color32) -> Color32 {
+    if is_dark() {
+        dark
+    } else {
+        light
+    }
+}
+
 const fn white(a: u8) -> Color32 {
     Color32::from_rgba_premultiplied(a, a, a, a)
 }
 
+const fn black(a: u8) -> Color32 {
+    Color32::from_black_alpha(a)
+}
+
+/// A wash of whatever the foreground colour is: white over dark chrome,
+/// black over light. Every incidental tint -- a hover fill, a hairline,
+/// a track -- goes through this rather than naming a colour, so the two
+/// themes cannot drift apart one highlight at a time.
+fn veil(a: u8) -> Color32 {
+    pick(white(a), black(a))
+}
+
 /// Muted blue, used *only* to mark selection. A reader's chrome should
-/// recede; colour here is information, not decoration.
-pub const ACCENT: Color32 = Color32::from_rgb(96, 165, 250);
+/// recede; colour here is information, not decoration. Darker in Light
+/// mode, where the pale blue had too little contrast against white to
+/// carry white text on top of it.
+pub fn accent() -> Color32 {
+    pick(
+        Color32::from_rgb(96, 165, 250),
+        Color32::from_rgb(37, 99, 235),
+    )
+}
 
-pub const CHROME: Color32 = Color32::from_black_alpha(234);
-pub const HAIRLINE: Color32 = white(20);
-pub const TEXT: Color32 = white(236);
-pub const TEXT_DIM: Color32 = white(150);
-pub const TEXT_FAINT: Color32 = white(96);
+/// The surface every floating element sits on.
+pub fn chrome() -> Color32 {
+    pick(
+        Color32::from_black_alpha(234),
+        Color32::from_white_alpha(238),
+    )
+}
 
-const SURFACE_HOVER: Color32 = white(26);
-const SURFACE_RAISED: Color32 = white(40);
-const TRACK_BG: Color32 = white(14);
+pub fn hairline() -> Color32 {
+    pick(white(20), black(26))
+}
+
+pub fn text() -> Color32 {
+    pick(white(236), black(228))
+}
+
+pub fn text_dim() -> Color32 {
+    pick(white(150), black(160))
+}
+
+pub fn text_faint() -> Color32 {
+    pick(white(96), black(110))
+}
+
+fn surface_hover() -> Color32 {
+    veil(26)
+}
+
+/// The lifted surface of a selected control.
+///
+/// Not a veil, and that is the whole point of it being written out. A
+/// raised surface is drawn over a contact shadow, and a translucent fill
+/// lets that shadow through: in Night the shadow is black on black and
+/// invisible, but in Light a veil let it darken the chip to gray(132)
+/// against a gray(241) track -- a selected segment that looked pressed
+/// into the surface rather than lifted off it. Opaque white sits on top
+/// of its own shadow, which is what makes the shadow read as lift.
+fn surface_raised() -> Color32 {
+    pick(white(40), Color32::WHITE)
+}
+
+/// The same surface under the pointer. In Light it cannot go brighter
+/// than the white it already is, so the hover is carried by the lift
+/// alone.
+fn surface_raised_hover() -> Color32 {
+    pick(white(56), Color32::WHITE)
+}
+
+fn track_bg() -> Color32 {
+    veil(14)
+}
 
 /// Two-layer shadow: a tight contact shadow plus a wide soft one. A single
 /// blur either looks hard at the edge or muddy underneath; stacking them
@@ -111,6 +202,11 @@ fn contact_shadow(strength: f32) -> Shadow {
 /// Installs the base style. Called on startup and whenever the theme
 /// flips, since `Visuals` carries the light/dark decision.
 pub fn install(ctx: &egui::Context, dark: bool) {
+    // First, before anything below reads a colour: the chrome palette
+    // runs off this, and `set_visuals` a few lines down is already one
+    // of its readers.
+    DARK.store(dark, Ordering::Relaxed);
+
     // Pin the preference before touching visuals, and it must be both:
     //
     // egui keeps a separate style per theme and serves whichever one
@@ -158,8 +254,8 @@ pub fn install(ctx: &egui::Context, dark: bool) {
     visuals.menu_rounding = Rounding::same(R_CARD);
     visuals.window_shadow = soft_shadow(1.0);
     visuals.popup_shadow = soft_shadow(1.0);
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.40);
-    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.selection.bg_fill = accent().gamma_multiply(0.40);
+    visuals.selection.stroke = Stroke::new(1.0_f32, accent());
 
     ctx.set_visuals(visuals);
 
@@ -179,9 +275,9 @@ pub fn install(ctx: &egui::Context, dark: bool) {
 /// bar, its dropdown, the status pills.
 pub fn chrome_frame(rounding: f32) -> egui::Frame {
     egui::Frame::none()
-        .fill(CHROME)
+        .fill(chrome())
         .rounding(Rounding::same(rounding))
-        .stroke(Stroke::new(1.0_f32, HAIRLINE))
+        .stroke(Stroke::new(1.0_f32, hairline()))
         .shadow(soft_shadow(1.0))
 }
 
@@ -196,7 +292,7 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
         .collect();
     ui.label(
         egui::RichText::new(spaced.trim_end())
-            .color(TEXT_FAINT)
+            .color(text_faint())
             .size(10.0),
     );
 }
@@ -205,7 +301,7 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
 pub fn divider(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, Rounding::ZERO, white(14));
+    ui.painter().rect_filled(rect, Rounding::ZERO, veil(14));
     ui.add_space(4.0);
 }
 
@@ -333,22 +429,22 @@ impl<'a> Pill<'a> {
 
         let (fill, text_col, lift) = match self.style {
             PillStyle::Ghost => (
-                Color32::TRANSPARENT.lerp_to_gamma(SURFACE_HOVER, hover),
-                TEXT_DIM.lerp_to_gamma(TEXT, hover),
+                Color32::TRANSPARENT.lerp_to_gamma(surface_hover(), hover),
+                text_dim().lerp_to_gamma(text(), hover),
                 0.0,
             ),
             PillStyle::Quiet => (
-                white(16).lerp_to_gamma(SURFACE_HOVER, hover),
-                TEXT_DIM.lerp_to_gamma(TEXT, hover),
+                veil(16).lerp_to_gamma(surface_hover(), hover),
+                text_dim().lerp_to_gamma(text(), hover),
                 0.0,
             ),
             PillStyle::Selected => (
-                SURFACE_RAISED.lerp_to_gamma(white(56), hover),
-                TEXT,
+                surface_raised().lerp_to_gamma(surface_raised_hover(), hover),
+                text(),
                 0.5 + 0.5 * hover,
             ),
             PillStyle::Accent => (
-                ACCENT.gamma_multiply(0.92).lerp_to_gamma(ACCENT, hover),
+                accent().gamma_multiply(0.92).lerp_to_gamma(accent(), hover),
                 Color32::WHITE,
                 0.6 + 0.4 * hover,
             ),
@@ -370,7 +466,7 @@ impl<'a> Pill<'a> {
             ui.painter().rect_stroke(
                 rect,
                 rounding,
-                Stroke::new(1.0_f32, white((22.0 * hover) as u8)),
+                Stroke::new(1.0_f32, veil((22.0 * hover) as u8)),
             );
         }
 
@@ -378,9 +474,9 @@ impl<'a> Pill<'a> {
         // is off" rather than "this is a dim piece of text".
         if !self.enabled {
             ui.painter()
-                .rect_stroke(rect, rounding, Stroke::new(1.0_f32, white(16)));
+                .rect_stroke(rect, rounding, Stroke::new(1.0_f32, veil(16)));
         }
-        let text_col = if self.enabled { text_col } else { TEXT_FAINT };
+        let text_col = if self.enabled { text_col } else { text_faint() };
         let (anchor, pos) = if self.align_left {
             (
                 Align2::LEFT_CENTER,
@@ -433,7 +529,7 @@ pub fn segmented(
     }
 
     ui.painter()
-        .rect_filled(track, Rounding::same(R_TRACK), TRACK_BG);
+        .rect_filled(track, Rounding::same(R_TRACK), track_bg());
     let inner = track.shrink(PAD);
     let id = ui.id().with(id_salt);
 
@@ -449,7 +545,7 @@ pub fn segmented(
     ui.painter()
         .add(contact_shadow(1.0).as_shape(indicator, ind_rounding));
     ui.painter()
-        .rect_filled(indicator, ind_rounding, SURFACE_RAISED);
+        .rect_filled(indicator, ind_rounding, surface_raised());
 
     let mut clicked = None;
     for (i, label) in labels.iter().enumerate() {
@@ -469,7 +565,7 @@ pub fn segmented(
         let hover =
             ui.ctx()
                 .animate_bool_with_time(id.with(("hov", i)), response.hovered(), T_HOVER);
-        let col = TEXT_DIM.lerp_to_gamma(TEXT, nearness.max(hover * 0.55));
+        let col = text_dim().lerp_to_gamma(text(), nearness.max(hover * 0.55));
 
         ui.painter().text(
             rect.center(),
@@ -503,14 +599,14 @@ pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
     let t = ctx.animate_bool_with_time(response.id.with("on"), *on, T_STATE);
     let hover = ctx.animate_bool_with_time(response.id.with("hov"), response.hovered(), T_HOVER);
 
-    let track = white(22).lerp_to_gamma(ACCENT, t);
+    let track = veil(22).lerp_to_gamma(accent(), t);
     let rounding = Rounding::same(rect.height() / 2.0);
     ui.painter().rect_filled(rect, rounding, track);
     if hover > 0.0 {
         ui.painter().rect_stroke(
             rect,
             rounding,
-            Stroke::new(1.0_f32, white((30.0 * hover) as u8)),
+            Stroke::new(1.0_f32, veil((30.0 * hover) as u8)),
         );
     }
 
@@ -530,7 +626,7 @@ pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
 pub fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> Response {
     let mut response = None;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(TEXT).size(12.5));
+        ui.label(egui::RichText::new(label).color(text()).size(12.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             response = Some(switch(ui, on));
         });
@@ -563,7 +659,7 @@ pub fn status_pill(
             chrome_frame(R_PILL)
                 .inner_margin(egui::Margin::symmetric(13.0, 7.0))
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(text).color(TEXT_DIM).size(11.5));
+                    ui.label(egui::RichText::new(text).color(text_dim()).size(11.5));
                 });
         });
 }
@@ -603,19 +699,19 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
     painter.rect_stroke(
         inset,
         Rounding::same(R_CARD + 6.0),
-        Stroke::new(2.0_f32, ACCENT.gamma_multiply(t * 0.85)),
+        Stroke::new(2.0_f32, accent().gamma_multiply(t * 0.85)),
     );
 
     let title = painter.layout_no_wrap(
         "Drop to open".to_owned(),
         egui::FontId::proportional(15.0),
-        TEXT.gamma_multiply(t),
+        text().gamma_multiply(t),
     );
     let sub = label.map(|l| {
         painter.layout_no_wrap(
             l.to_owned(),
             egui::FontId::proportional(11.5),
-            TEXT_DIM.gamma_multiply(t),
+            text_dim().gamma_multiply(t),
         )
     });
 
@@ -629,11 +725,11 @@ pub fn drop_overlay(ctx: &egui::Context, t: f32, label: Option<&str>) {
     );
     let rounding = Rounding::same(R_CARD);
     painter.add(soft_shadow(t).as_shape(card, rounding));
-    painter.rect_filled(card, rounding, CHROME.gamma_multiply(t));
+    painter.rect_filled(card, rounding, chrome().gamma_multiply(t));
     painter.rect_stroke(
         card,
         rounding,
-        Stroke::new(1.0_f32, HAIRLINE.gamma_multiply(t)),
+        Stroke::new(1.0_f32, hairline().gamma_multiply(t)),
     );
 
     let title_y = if sub.is_some() {
@@ -673,7 +769,7 @@ pub fn counter_label(ui: &mut egui::Ui, text: &str, slot_w: f32) {
         Align2::CENTER_CENTER,
         text,
         egui::FontId::proportional(COUNTER_FONT),
-        TEXT_DIM,
+        text_dim(),
     );
 }
 
@@ -723,6 +819,20 @@ pub fn page_capsule(ctx: &egui::Context, offset_y: f32, text: &str, t: f32) {
 mod tests {
     use super::*;
     use eframe::egui::{Theme, ThemePreference};
+    use std::sync::Mutex;
+
+    /// The palette is process-global, so the tests that move it have to
+    /// take turns. Without this they are the same race the CLI fixtures
+    /// had: parallel threads writing one thing and reading it back,
+    /// green here and intermittent on a slower machine.
+    ///
+    /// Poisoning is stepped over rather than propagated -- one failing
+    /// test should fail alone, not take the rest of the file with it.
+    static PALETTE: Mutex<()> = Mutex::new(());
+
+    fn palette_guard() -> std::sync::MutexGuard<'static, ()> {
+        PALETTE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Pins the bug behind v0.2.1: egui keeps one style per theme and
     /// serves whichever `Context::theme()` names. Left on the system
@@ -730,8 +840,57 @@ mod tests {
     /// reports Light on frame 0 -- served a stock palette while the
     /// app's own switch said otherwise, which painted black Markdown
     /// text onto the dark background until the switch was toggled.
+    /// The chrome used to be black in both themes, so Light mode left
+    /// the top bar and the page capsule dark. Both now follow the
+    /// switch, and in opposite directions.
+    #[test]
+    fn the_chrome_palette_follows_the_mode() {
+        let _serialised = palette_guard();
+        let ctx = egui::Context::default();
+
+        install(&ctx, true);
+        let (dark_chrome, dark_text) = (chrome(), text());
+
+        install(&ctx, false);
+        let (light_chrome, light_text) = (chrome(), text());
+
+        assert_ne!(dark_chrome, light_chrome, "the surface must change");
+        assert_ne!(dark_text, light_text, "the text must change with it");
+
+        // And in opposite directions: a dark surface carries light text,
+        // a light surface dark text.
+        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        assert!(
+            lum(dark_chrome) < lum(dark_text),
+            "Night: text should be lighter than the surface"
+        );
+        assert!(
+            lum(light_chrome) > lum(light_text),
+            "Light: text should be darker than the surface"
+        );
+    }
+
+    /// `veil` is what every incidental tint goes through, so this is the
+    /// one place the two themes could silently drift apart.
+    #[test]
+    fn a_veil_washes_toward_the_foreground_of_whichever_theme_is_on() {
+        let _serialised = palette_guard();
+        let ctx = egui::Context::default();
+
+        install(&ctx, true);
+        let dark_veil = veil(40);
+        install(&ctx, false);
+        let light_veil = veil(40);
+
+        // Over a dark chrome a veil lightens; over a light one it darkens.
+        assert!(dark_veil.r() > 0, "Night veils lighten");
+        assert_eq!(light_veil.r(), 0, "Light veils darken");
+        assert_eq!(dark_veil.a(), light_veil.a(), "same strength either way");
+    }
+
     #[test]
     fn install_overrides_whatever_the_desktop_asked_for() {
+        let _serialised = palette_guard();
         for (dark, want) in [(true, Theme::Dark), (false, Theme::Light)] {
             let ctx = egui::Context::default();
             // Stand in for a desktop insisting on the opposite theme.

@@ -686,7 +686,7 @@ fn palette(dark: bool) -> Palette {
             text: egui::Color32::from_gray(242),
             dim: egui::Color32::from_gray(186),
             faint: egui::Color32::from_gray(132),
-            link: theme::ACCENT,
+            link: theme::accent(),
             code_bg: egui::Color32::from_gray(46),
             rule: egui::Color32::from_gray(64),
             dark: true,

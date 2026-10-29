@@ -1646,7 +1646,7 @@ impl SenpaiApp {
                                                 "{}%",
                                                 zoom_percent(self.scale)
                                             ))
-                                            .color(theme::TEXT_FAINT)
+                                            .color(theme::text_faint())
                                             .size(theme::COUNTER_FONT - 1.0),
                                         );
                                     }
@@ -1773,7 +1773,11 @@ impl SenpaiApp {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.display().to_string());
             ui.add_space(2.0);
-            ui.label(egui::RichText::new(name).color(theme::TEXT_DIM).size(11.5));
+            ui.label(
+                egui::RichText::new(name)
+                    .color(theme::text_dim())
+                    .size(11.5),
+            );
             let detail = match &self.text {
                 // A text file has no page count to report, so say what
                 // it is instead -- the view behaves differently and the
@@ -1789,7 +1793,7 @@ impl SenpaiApp {
             };
             ui.label(
                 egui::RichText::new(elide(&detail, RECENT_NAME_CHARS))
-                    .color(theme::TEXT_FAINT)
+                    .color(theme::text_faint())
                     .size(10.5),
             );
         }
@@ -1863,7 +1867,7 @@ impl SenpaiApp {
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new("Not built yet — Phase 3 in the roadmap.")
-                .color(theme::TEXT_FAINT)
+                .color(theme::text_faint())
                 .size(10.5),
         );
     }
@@ -1883,7 +1887,7 @@ impl SenpaiApp {
             // neither mode has anything to apply to.
             ui.label(
                 egui::RichText::new("Text reflows to the window. View modes apply to PDFs.")
-                    .color(theme::TEXT_FAINT)
+                    .color(theme::text_faint())
                     .size(10.5),
             );
         } else {
@@ -1911,7 +1915,7 @@ impl SenpaiApp {
         if self.rebinding.is_some() {
             ui.label(
                 egui::RichText::new("Press any key, or Escape to cancel.")
-                    .color(theme::TEXT_FAINT)
+                    .color(theme::text_faint())
                     .size(10.5),
             );
         }
@@ -1924,7 +1928,7 @@ impl SenpaiApp {
         };
         let listening = self.rebinding == Some(target);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(label).color(theme::TEXT).size(12.5));
+            ui.label(egui::RichText::new(label).color(theme::text()).size(12.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let caption = if listening {
                     "press a key…".to_string()
@@ -1957,7 +1961,7 @@ impl SenpaiApp {
         }
         ui.label(
             egui::RichText::new("Reveal by hovering the top edge, or Alt+F / T / M / O.")
-                .color(theme::TEXT_FAINT)
+                .color(theme::text_faint())
                 .size(10.5),
         );
     }
