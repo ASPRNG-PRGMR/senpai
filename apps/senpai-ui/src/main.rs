@@ -148,6 +148,9 @@ const CONTINUOUS_BUFFER_PAGES: usize = 1;
 /// How long the lone page capsule takes to leave. Shorter than the
 /// bar's own fade so it is out of the way before the bar is fully there.
 const PAGE_PILL_FADE: f32 = 0.09;
+/// Largest text file either text view will open. See `read_text`.
+const MAX_TEXT_BYTES: usize = 512 * 1024;
+
 /// Settles who owns the zoom shortcuts.
 ///
 /// egui binds Ctrl +, Ctrl = and Ctrl - to a zoom of its own -- the
@@ -197,6 +200,23 @@ const RECENT_NAME_CHARS: usize = 34;
 enum DocumentContent {
     Pdf(Box<(PopplerEngine, usize, PageSize)>),
     Markdown(markdown::Document),
+    Plain(String),
+}
+
+/// What the reader is currently showing, when it is not a PDF.
+///
+/// One slot rather than a field per kind: they are mutually exclusive,
+/// and a pair of `Option`s invites the state where both are set.
+enum TextDoc {
+    Markdown(markdown::Document),
+    Plain(String),
+}
+
+fn is_plain_text(path: &Path) -> bool {
+    path.extension().is_some_and(|e| {
+        let e = e.to_string_lossy().to_lowercase();
+        e == "txt" || e == "text"
+    })
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -206,28 +226,51 @@ fn is_markdown(path: &Path) -> bool {
     })
 }
 
-/// Reads and parses a Markdown file.
+/// Reads a text file whole, as lossy UTF-8.
 ///
-/// Read whole rather than mapped, unlike a PDF: the parser walks the
-/// entire text anyway, the files are small, and it has to be valid UTF-8
-/// to be text at all. Invalid bytes are replaced rather than rejected --
-/// a stray byte in a mostly-readable file should not stop it opening.
-fn load_markdown(path: &Path) -> Result<markdown::Document, String> {
+/// Read whole rather than mapped, unlike a PDF: both text views walk the
+/// entire file anyway. Invalid bytes are replaced rather than rejected
+/// -- a stray byte in a mostly-readable file should not stop it opening.
+///
+/// The size limit is real rather than defensive. Neither text view is
+/// virtualised: every block, or the whole plain-text galley, is laid out
+/// for each frame it is on screen. That is fine for documents and notes
+/// and hopeless for a log, so the limit refuses the file with a reason
+/// instead of hanging the window on it.
+fn read_text(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("could not open: {e}"))?;
-    Ok(markdown::parse(&String::from_utf8_lossy(&bytes)))
+    if bytes.len() > MAX_TEXT_BYTES {
+        return Err(format!(
+            "{:.1}MB of text; the limit is {}KB, because the text views lay the whole \
+             file out on every frame rather than only the part on screen",
+            bytes.len() as f64 / 1_000_000.0,
+            MAX_TEXT_BYTES / 1024
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Picks which of several dropped files to open.
 ///
-/// Something this reader knows how to open -- a PDF or a Markdown file
-/// -- wins outright. Failing that the first file is taken anyway rather
-/// than the drop being ignored: a PDF with no extension is a real thing,
-/// and when it genuinely is not one, letting the loader fail says which
-/// file and why -- which silently doing nothing does not.
+/// By precedence rather than by position: a PDF first, then Markdown,
+/// then plain text.
+///
+/// Order matters once more than one kind is recognised. A drop carrying
+/// a paper and the notes beside it should open the paper, whichever the
+/// file manager happened to list first -- and `.txt` being the broadest
+/// kind, it is the one most likely to be along for the ride rather than
+/// the thing meant.
+///
+/// Failing all three the first file is taken anyway rather than the drop
+/// being ignored: a PDF with no extension is a real thing, and when it
+/// genuinely is not one, letting the loader fail says which file and why
+/// -- which silently doing nothing does not.
 fn pick_dropped_document(paths: &[PathBuf]) -> Option<&Path> {
     paths
         .iter()
-        .find(|p| is_pdf(p) || is_markdown(p))
+        .find(|p| is_pdf(p))
+        .or_else(|| paths.iter().find(|p| is_markdown(p)))
+        .or_else(|| paths.iter().find(|p| is_plain_text(p)))
         .or_else(|| paths.first())
         .map(PathBuf::as_path)
 }
@@ -457,9 +500,9 @@ struct SenpaiApp {
     /// Documents opened before, newest first. Also decides where the
     /// file dialog starts -- see the note at the top of `recent.rs`.
     recent: recent::Recent,
-    /// The parsed document when a Markdown file is open. Mutually
-    /// exclusive with a PDF: installing either clears the other.
-    markdown: Option<markdown::Document>,
+    /// The document when a text file is open, Markdown or plain.
+    /// Mutually exclusive with a PDF: installing either clears the other.
+    text: Option<TextDoc>,
     /// Pixels the Markdown view should scroll on the next frame, from a
     /// page-navigation key. Applied inside the scroll area, which is the
     /// only place the offset can be changed.
@@ -548,7 +591,7 @@ impl SenpaiApp {
             pending_open: None,
             open_error: None,
             recent: recent::Recent::load(),
-            markdown: None,
+            text: None,
             md_scroll: 0.0,
             drop_label: None,
             render_started: None,
@@ -597,9 +640,13 @@ impl SenpaiApp {
                 // The combined filter goes first because it is the
                 // default selection, and "anything this reader opens" is
                 // what someone browsing actually wants to see.
-                .add_filter("Documents", &["pdf", "md", "markdown", "mdown", "mkd"])
+                .add_filter(
+                    "Documents",
+                    &["pdf", "md", "markdown", "mdown", "mkd", "txt", "text"],
+                )
                 .add_filter("PDF document", &["pdf"])
-                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"]);
+                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+                .add_filter("Plain text", &["txt", "text"]);
             if let Some(dir) = start_dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -679,7 +726,9 @@ impl SenpaiApp {
     /// than a guess would be.
     fn open_document(&mut self, ctx: &egui::Context, path: &Path) {
         let result = if is_markdown(path) {
-            load_markdown(path).map(DocumentContent::Markdown)
+            read_text(path).map(|t| DocumentContent::Markdown(markdown::parse(&t)))
+        } else if is_plain_text(path) {
+            read_text(path).map(DocumentContent::Plain)
         } else {
             load_document(path).map(|(engine, page_count, size)| {
                 DocumentContent::Pdf(Box::new((engine, page_count, size)))
@@ -693,7 +742,12 @@ impl SenpaiApp {
                 self.recent.record(path);
             }
             Ok(DocumentContent::Markdown(doc)) => {
-                self.install_markdown(ctx, path, doc);
+                self.install_text(ctx, path, TextDoc::Markdown(doc));
+                self.open_error = None;
+                self.recent.record(path);
+            }
+            Ok(DocumentContent::Plain(text)) => {
+                self.install_text(ctx, path, TextDoc::Plain(text));
                 self.open_error = None;
                 self.recent.record(path);
             }
@@ -703,19 +757,20 @@ impl SenpaiApp {
         }
     }
 
-    /// Swaps in a Markdown document, retiring any PDF worker first.
+    /// Swaps in a text document of either kind, retiring any PDF worker
+    /// first.
     ///
     /// Shares `retire_worker` with the PDF path rather than duplicating
     /// it: leaving a worker running against a document nobody is looking
     /// at would keep its engine handle -- and its memory -- alive for as
     /// long as the app ran.
-    fn install_markdown(&mut self, ctx: &egui::Context, path: &Path, doc: markdown::Document) {
+    fn install_text(&mut self, ctx: &egui::Context, path: &Path, doc: TextDoc) {
         self.retire_worker();
         self.page_count = 0;
         self.current_page = 0;
         self.known_page_heights.clear();
         self.md_scroll = 0.0;
-        self.markdown = Some(doc);
+        self.text = Some(doc);
         self.doc_path = Some(path.to_path_buf());
         self.set_window_title(ctx, path);
     }
@@ -734,7 +789,7 @@ impl SenpaiApp {
         estimated_page_size: PageSize,
     ) {
         self.retire_worker();
-        self.markdown = None;
+        self.text = None;
 
         let shared: Shared = Arc::new((
             Mutex::new(WorkerState {
@@ -803,7 +858,7 @@ impl SenpaiApp {
 
     /// Whether anything is open at all, in either reader.
     fn has_document(&self) -> bool {
-        self.page_count > 0 || self.markdown.is_some()
+        self.page_count > 0 || self.text.is_some()
     }
 
     fn insert_texture(&mut self, key: (usize, u64), handle: egui::TextureHandle) {
@@ -1048,7 +1103,7 @@ impl eframe::App for SenpaiApp {
                         i.modifiers.command && i.key_pressed(egui::Key::Num0),
                     )
                 });
-            if self.markdown.is_some() {
+            if self.text.is_some() {
                 // The page keys keep meaning "move on by one screenful"
                 // in a format that has no pages. Slightly less than a
                 // full screen, so a line or two carries over and the eye
@@ -1142,8 +1197,8 @@ impl eframe::App for SenpaiApp {
             return;
         }
 
-        if self.markdown.is_some() {
-            self.show_markdown_view(ctx, bg);
+        if self.text.is_some() {
+            self.show_text_view(ctx, bg);
             self.show_top_bar(ctx, bar_t);
             return;
         }
@@ -1340,16 +1395,17 @@ impl SenpaiApp {
             });
     }
 
-    /// The Markdown reader: one scrolling, centred reading column.
+    /// The text reader -- Markdown or plain: one scrolling, centred
+    /// column.
     ///
     /// No paging, no render cache, no prefetch -- see the note at the top
-    /// of `markdown.rs` for why this format does not go through the page
+    /// of `markdown.rs` for why text does not go through the page
     /// pipeline the rest of the reader is built on.
-    fn show_markdown_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
+    fn show_text_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
         let zoom = (self.scale / DEFAULT_SCALE) as f32;
         let dark = self.dark_mode;
         let scroll = std::mem::take(&mut self.md_scroll);
-        let Some(doc) = &self.markdown else {
+        let Some(doc) = &self.text else {
             return;
         };
         egui::CentralPanel::default()
@@ -1367,7 +1423,10 @@ impl SenpaiApp {
                         ui.vertical(|ui| {
                             ui.set_width(width);
                             ui.add_space(30.0 * zoom);
-                            markdown::show(ui, doc, zoom, dark);
+                            match doc {
+                                TextDoc::Markdown(doc) => markdown::show(ui, doc, zoom, dark),
+                                TextDoc::Plain(text) => markdown::show_plain(ui, text, zoom, dark),
+                            }
                             // Room to scroll the last line clear of the
                             // bottom edge, the way a page has a margin.
                             ui.add_space(60.0 * zoom);
@@ -1669,14 +1728,17 @@ impl SenpaiApp {
                 .unwrap_or_else(|| path.display().to_string());
             ui.add_space(2.0);
             ui.label(egui::RichText::new(name).color(theme::TEXT_DIM).size(11.5));
-            let detail = match &self.markdown {
-                // A Markdown file has no page count to report, so say
-                // what it is instead -- the view behaves differently and
-                // the menu is where that is explained.
-                Some(doc) => match &doc.title {
+            let detail = match &self.text {
+                // A text file has no page count to report, so say what
+                // it is instead -- the view behaves differently and the
+                // menu is where that is explained.
+                Some(TextDoc::Markdown(doc)) => match &doc.title {
                     Some(title) => format!("Markdown — {title}"),
                     None => "Markdown".to_owned(),
                 },
+                Some(TextDoc::Plain(text)) => {
+                    format!("Plain text — {} lines", text.lines().count())
+                }
                 None => format!("{} pages", self.page_count),
             };
             ui.label(
@@ -1769,12 +1831,12 @@ impl SenpaiApp {
 
         theme::divider(ui);
         theme::section_label(ui, "View mode");
-        if self.markdown.is_some() {
+        if self.text.is_some() {
             // Offering a switch that does nothing is worse than not
             // offering it: Markdown reflows to the window by nature, so
             // neither mode has anything to apply to.
             ui.label(
-                egui::RichText::new("Markdown reflows to the window. View modes apply to PDFs.")
+                egui::RichText::new("Text reflows to the window. View modes apply to PDFs.")
                     .color(theme::TEXT_FAINT)
                     .size(10.5),
             );
@@ -1858,8 +1920,8 @@ impl SenpaiApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_context, elide, is_markdown, pick_dropped_document, should_dismiss_menu,
-        zoom_percent, DEFAULT_SCALE, RECENT_NAME_CHARS,
+        configure_context, elide, is_markdown, is_plain_text, pick_dropped_document,
+        should_dismiss_menu, zoom_percent, DEFAULT_SCALE, RECENT_NAME_CHARS,
     };
     use eframe::egui::{self, pos2, Rect};
     use std::path::{Path, PathBuf};
@@ -1995,8 +2057,27 @@ mod tests {
     /// name. An extensionless PDF opens by this path too.
     #[test]
     fn without_a_known_type_the_first_file_is_tried_anyway() {
-        let dropped = paths(&["/scan", "/notes.txt"]);
+        let dropped = paths(&["/scan", "/notes.dat"]);
         assert_eq!(pick_dropped_document(&dropped), Some(Path::new("/scan")));
+    }
+
+    /// Whichever order the file manager hands them over in.
+    #[test]
+    fn the_known_kinds_are_preferred_in_order() {
+        let all = ["/a.txt", "/b.md", "/c.pdf"];
+        for rotation in 0..all.len() {
+            let mut names = all;
+            names.rotate_left(rotation);
+            let dropped = paths(&names);
+            assert_eq!(
+                pick_dropped_document(&dropped),
+                Some(Path::new("/c.pdf")),
+                "order {names:?}"
+            );
+        }
+        // With no PDF among them, Markdown comes before plain text.
+        let dropped = paths(&["/a.txt", "/b.md"]);
+        assert_eq!(pick_dropped_document(&dropped), Some(Path::new("/b.md")));
     }
 
     #[test]
@@ -2044,5 +2125,40 @@ mod tests {
         for name in ["a.pdf", "a.txt", "a", "a.mdx"] {
             assert!(!is_markdown(Path::new(name)), "{name} should not be");
         }
+    }
+
+    #[test]
+    fn plain_text_is_recognised_by_its_extension_in_any_case() {
+        for name in ["notes.txt", "NOTES.TXT", "a.text"] {
+            assert!(
+                is_plain_text(Path::new(name)),
+                "{name} should be plain text"
+            );
+        }
+        for name in ["a.md", "a.pdf", "a", "a.texts"] {
+            assert!(!is_plain_text(Path::new(name)), "{name} should not be");
+        }
+    }
+
+    /// Plain text is not Markdown: a `.txt` whose author wrote a row of
+    /// dashes meant dashes, so the two must not be confused by extension.
+    #[test]
+    fn the_two_text_kinds_do_not_overlap() {
+        for name in ["a.md", "a.markdown", "a.txt", "a.text"] {
+            let p = Path::new(name);
+            assert!(
+                is_markdown(p) != is_plain_text(p),
+                "{name} should be exactly one of the two"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_text_file_is_opened_too() {
+        let dropped = paths(&["/image.png", "/notes.txt"]);
+        assert_eq!(
+            pick_dropped_document(&dropped),
+            Some(Path::new("/notes.txt"))
+        );
     }
 }

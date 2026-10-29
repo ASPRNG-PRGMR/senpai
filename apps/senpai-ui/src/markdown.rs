@@ -1,4 +1,4 @@
-//! CommonMark reading support.
+//! CommonMark reading support, and the plain-text view beside it.
 //!
 //! # Why this does not go through `PdfEngine`
 //!
@@ -1003,6 +1003,30 @@ fn space_before(block: &Block, first: bool) -> f32 {
         BlockKind::Rule => 15.0,
         BlockKind::Paragraph(_) => 11.0,
     }
+}
+
+/// Lays plain text out in the same column, verbatim.
+///
+/// Set in monospace and never parsed. A `.txt` file is text that happens
+/// to contain whatever characters it contains: running it through the
+/// Markdown parser would turn a line of dashes into a rule, a leading
+/// `#` into a heading and an asterisk into emphasis, none of which its
+/// author wrote. Monospace because the common case -- logs, notes,
+/// pasted code -- is written expecting a fixed advance, and because
+/// anything column-aligned falls apart without one.
+///
+/// It lives in this module rather than its own because it shares all
+/// three of the things that make the view what it is: the palette, the
+/// column, and the meaning of `zoom`. A second module would duplicate
+/// them to render one label.
+pub fn show_plain(ui: &mut egui::Ui, text: &str, zoom: f32, dark: bool) {
+    let pal = palette(dark);
+    ui.label(
+        egui::RichText::new(text)
+            .monospace()
+            .size(BASE_FONT * 0.95 * zoom)
+            .color(pal.text),
+    );
 }
 
 /// The width the reading column should take inside `available`.
