@@ -49,10 +49,9 @@ use std::collections::VecDeque;
 /// between runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum WheelStep {
-    /// A couple of lines of text at a reading zoom. The default: small
-    /// enough to stop on the line wanted, large enough that getting
-    /// down a page is not a chore. It was 30 points at first, which was
-    /// exact and tiresome.
+    /// The default: a few lines of text at a reading zoom. Arrived at
+    /// by use rather than by reasoning -- 30 points was exact and
+    /// tiresome, 45 still slow with a real wheel.
     #[default]
     Fine,
     Normal,
