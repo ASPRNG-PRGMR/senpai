@@ -209,6 +209,85 @@ fn w_stays_a_direction_for_someone_who_bound_it_to_one() {
     });
 }
 
+impl Reader {
+    /// Reveals the top bar and clicks one of its menu buttons, the way
+    /// someone on their way to Modes or Options would.
+    fn click_a_menu_button(&mut self) {
+        self.frame(vec![Event::PointerMoved(pos2(500.0, 10.0))]);
+        for _ in 0..30 {
+            self.frame(vec![]);
+        }
+        let bar = self.app.bar_rect;
+        assert!(bar.is_positive(), "the bar did not appear");
+        let at = pos2(bar.left() + 40.0, bar.center().y);
+        self.frame(vec![Event::PointerMoved(at)]);
+        self.frame(vec![Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        self.frame(vec![Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        self.frame(vec![]);
+        assert!(self.app.open_menu.is_some(), "the click missed the button");
+    }
+}
+
+/// Keys must not go dead because something on the bar was clicked.
+#[test]
+fn keys_still_work_after_clicking_something_on_the_bar() {
+    both_modes(|mut r| {
+        r.click_a_menu_button();
+        r.press(Key::W);
+        assert_eq!(r.app.fit, Some(Fit::Width));
+        r.press(Key::F);
+        assert_eq!(r.app.fit, Some(Fit::Page));
+        r.press(Key::Plus);
+        assert_eq!(r.app.fit, None);
+        // And Escape still closes the menu the click opened.
+        r.press(Key::Escape);
+        r.press(Key::Escape);
+        assert!(r.app.open_menu.is_none());
+    });
+}
+
+/// The capsule that names the zoom stays one line when what it says
+/// gets longer.
+///
+/// An egui area remembers the width it first came out at and offers
+/// that to its contents from then on. A label that wraps to what it is
+/// offered was therefore fine the first time and broken the second:
+/// "92%" set the width, and "126%" had to fit in it, one or two
+/// characters to a line.
+#[test]
+fn the_zoom_capsule_stays_on_one_line_as_its_text_grows() {
+    both_modes(|mut r| {
+        let capsule = |r: &Reader| {
+            r.ctx
+                .memory(|m| m.area_rect(egui::Id::new("zoom_note_pill")))
+                .expect("the capsule is on screen")
+        };
+        // A short note first, then a much longer one.
+        r.press(Key::Plus);
+        let short = capsule(&r);
+        r.press(Key::W);
+        r.frame(vec![]);
+        let long = capsule(&r);
+        assert!(
+            (long.height() - short.height()).abs() < 0.5,
+            "the capsule went from {} tall to {}",
+            short.height(),
+            long.height()
+        );
+        assert!(long.width() > short.width() + 20.0);
+    });
+}
+
 /// F on a page that is already fitted changes nothing on screen. It
 /// still has to be acknowledged, or it reads as a dead key.
 #[test]

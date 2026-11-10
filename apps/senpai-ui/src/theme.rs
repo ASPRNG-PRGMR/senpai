@@ -675,7 +675,14 @@ pub fn status_pill(
             chrome_frame(R_PILL)
                 .inner_margin(egui::Margin::symmetric(13.0, 7.0))
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(text).color(text_dim()).size(11.5));
+                    // Never wrapped. An area anchored to the middle of an
+                    // edge is laid out with almost no width to offer, and
+                    // a label that wraps to what it is offered came out
+                    // two characters wide and several lines tall.
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).color(text_dim()).size(11.5))
+                            .extend(),
+                    );
                 });
         });
 }
