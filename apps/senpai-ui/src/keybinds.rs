@@ -101,11 +101,16 @@ impl Preset {
 
     pub fn keys(self) -> [(NavTarget, Key); 4] {
         match self {
+            // h j k l, as vim has them: j is down and k is up. An
+            // earlier version of this preset had j l i k -- a cluster
+            // shaped like the arrow keys, which is a fine layout but is
+            // not vim's, and anyone choosing "Vim" has j and k in their
+            // fingers already.
             Self::Vim => [
-                (NavTarget::Left, Key::J),
+                (NavTarget::Left, Key::H),
                 (NavTarget::Right, Key::L),
-                (NavTarget::Up, Key::I),
-                (NavTarget::Down, Key::K),
+                (NavTarget::Up, Key::K),
+                (NavTarget::Down, Key::J),
             ],
             Self::Gamer => [
                 (NavTarget::Left, Key::A),
@@ -250,7 +255,7 @@ mod tests {
                 "{target:?} must keep a key that cannot be taken away"
             );
         }
-        assert_eq!(keys.get(NavTarget::Left), Some(Key::J));
+        assert_eq!(keys.get(NavTarget::Left), Some(Key::H));
     }
 
     #[test]
@@ -270,10 +275,10 @@ mod tests {
     fn the_two_presets_are_what_people_asked_for() {
         let mut keys = NavKeys::default();
         keys.apply(Preset::Vim);
-        assert_eq!(keys.get(NavTarget::Left), Some(Key::J));
+        assert_eq!(keys.get(NavTarget::Left), Some(Key::H));
         assert_eq!(keys.get(NavTarget::Right), Some(Key::L));
-        assert_eq!(keys.get(NavTarget::Up), Some(Key::I));
-        assert_eq!(keys.get(NavTarget::Down), Some(Key::K));
+        assert_eq!(keys.get(NavTarget::Up), Some(Key::K));
+        assert_eq!(keys.get(NavTarget::Down), Some(Key::J));
 
         keys.apply(Preset::Gamer);
         assert_eq!(keys.get(NavTarget::Left), Some(Key::A));
@@ -330,10 +335,10 @@ mod tests {
 
     #[test]
     fn a_damaged_file_costs_only_the_lines_it_damaged() {
-        let keys = parse("left=J\nnonsense\nright=NotAKey\nup=I\n= \ndown=K\n");
-        assert_eq!(keys.get(NavTarget::Left), Some(Key::J));
-        assert_eq!(keys.get(NavTarget::Up), Some(Key::I));
-        assert_eq!(keys.get(NavTarget::Down), Some(Key::K));
+        let keys = parse("left=H\nnonsense\nright=NotAKey\nup=K\n= \ndown=J\n");
+        assert_eq!(keys.get(NavTarget::Left), Some(Key::H));
+        assert_eq!(keys.get(NavTarget::Up), Some(Key::K));
+        assert_eq!(keys.get(NavTarget::Down), Some(Key::J));
         assert_eq!(keys.get(NavTarget::Right), None);
     }
 
