@@ -256,6 +256,36 @@ fn keys_still_work_after_clicking_something_on_the_bar() {
     });
 }
 
+/// Pressing F part-way down a page shows that page, whole -- not the
+/// bottom of it and the top of the next at their new size.
+#[test]
+fn fit_page_in_continuous_brings_the_page_into_view() {
+    let mut r = Reader::open("fit-snaps", ViewMode::Continuous);
+    r.press(Key::W);
+    r.app.go_to_page(3);
+    r.frame(vec![]);
+    // Most of a screen further down: well into page 4's lower half is
+    // not reached, so page 4 (index 3) is still the one being read.
+    r.app.continuous.scroll_by_screens(0.6);
+    for _ in 0..60 {
+        r.frame(vec![]);
+    }
+    assert_eq!(r.app.current_page, 3);
+    let mid_page = r.app.continuous.offset().y;
+
+    r.press(Key::F);
+    r.frame(vec![]);
+    assert_eq!(r.app.current_page, 3);
+    // Exactly a window per page now, and sitting on a page boundary.
+    let pitch = SCREEN.y - continuous::PAGE_GAP;
+    let offset = r.app.continuous.offset().y;
+    let pages_down = offset / pitch;
+    assert!(
+        (pages_down - 3.0).abs() < 0.01,
+        "was at {mid_page}, ended {pages_down} pages down"
+    );
+}
+
 /// Ctrl + scroll is how a zoom is done, and a platform can go on
 /// reporting Ctrl as held afterwards. F and W are what is wanted next.
 #[test]

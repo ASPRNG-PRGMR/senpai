@@ -1235,6 +1235,15 @@ impl SenpaiApp {
     fn set_fit(&mut self, fit: Fit) {
         if self.text.is_none() {
             self.fit = Some(fit);
+            if fit == Fit::Page && self.view_mode == ViewMode::Continuous {
+                // Fit page is a request to see one page, whole. Making
+                // it the right size and leaving the view wherever it
+                // was -- half of this page and half of the next, each
+                // now exactly a window tall -- answers the letter of
+                // that and none of the point. So the page being read
+                // is also brought to the top.
+                self.continuous.go_to_page(self.current_page);
+            }
             // Even when it was this fit already. F on a page that is
             // fitted changes nothing on screen, and a key that changes
             // nothing looks like a key that does nothing; the note is

@@ -372,6 +372,12 @@ impl View {
         self.pending = Some((Anchor::top_of(page), None));
     }
 
+    /// Where the view is scrolled to.
+    #[cfg(test)]
+    pub fn offset(&self) -> egui::Vec2 {
+        self.offset
+    }
+
     /// Moves by whole pages on the next frame.
     pub fn turn_pages(&mut self, steps: i32) {
         self.page_steps += steps;
@@ -500,7 +506,14 @@ impl View {
                 Rect::from_min_size(origin, vec2(layout.width(), layout.total())),
                 egui::Sense::hover(),
             );
-            let visible = layout.visible(viewport.min.y, viewport.max.y);
+            // Shrunk by a point at each end, so a page with less than
+            // that showing is not shown. A fitted page is a fraction of
+            // a point shorter than the room it was fitted to -- the fit
+            // is rounded down -- which leaves exactly that much of the
+            // next page inside the window: a one-pixel line of somebody
+            // else's paper along the bottom edge of a page that was
+            // asked to fill the screen on its own.
+            let visible = layout.visible(viewport.min.y + 1.0, viewport.max.y - 1.0);
             for page in visible.clone() {
                 paint(ui.painter(), page, layout.page_rect(page, origin));
             }
@@ -1063,6 +1076,39 @@ mod tests {
         let (_, painted) = frame(&ctx, &mut view, &pages, 2.0);
         assert!((painted[0].1.center().x - SCREEN.x / 2.0).abs() < 0.01);
         assert!((painted[0].1.min.y - PAGE_GAP).abs() < 0.01);
+    }
+
+    /// Fit page means one page on screen. Not one page and the top
+    /// edge of the next.
+    #[test]
+    fn a_fitted_page_has_the_window_to_itself() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.spacing.scroll.floating = true);
+        let mut view = View::new("test");
+        let pages = [LETTER; 10];
+        // A window size at which the rounded-down fit leaves most of a
+        // point of the next page inside the window.
+        for height in [600.0_f32, 601.0, 733.0, 1187.0] {
+            // Wide, so that it is the height the page is fitted to.
+            let screen = vec2(1200.0, height);
+            let scale = fit_scale(Fit::Page, LETTER, screen);
+            view.go_to_page(4);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+                ..Default::default()
+            };
+            let mut painted = Vec::new();
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        view.show(ui, &pages, scale, None, STEP, |_, page, _| {
+                            painted.push(page);
+                        });
+                    });
+            });
+            assert_eq!(painted, vec![4], "in a window {height} tall");
+        }
     }
 
     /// The paged view is this view over a one-page slice: a different
