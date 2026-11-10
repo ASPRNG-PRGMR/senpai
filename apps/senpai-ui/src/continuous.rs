@@ -17,11 +17,20 @@
 //! corrected each one as it was rendered, which moved everything below
 //! it -- including whatever was being read.
 //!
-//! The reading position is kept as an [`Anchor`] -- a page and a fraction
-//! of the way down it -- rather than as a pixel offset. An offset means
-//! something only for one zoom level and one window width; an anchor
-//! survives both, which is what lets a zoom or a resize leave the same
-//! line of the same page at the top of the window.
+//! A reading position is an [`Anchor`] -- a page and how far down and
+//! across it -- rather than a pixel offset. An offset means something
+//! only for one zoom level and one window size; an anchor survives
+//! both. That is what lets a resize leave the same line at the top of
+//! the window, and a pinch leave the word under the pointer under the
+//! pointer.
+//!
+//! Pages are laid out at their real size for the zoom level. One wider
+//! than the window makes the column wider than the window, and the view
+//! scrolls sideways to reach the rest of it; nothing is shrunk to fit.
+//! Fitting is a zoom level the caller chooses (see [`fit_scale`]), not
+//! something the layout does behind its back.
+//!
+//! The paged view is this same view, shown one page at a time.
 
 use crate::scroll::Scroller;
 use eframe::egui::{self, pos2, vec2, Pos2, Rect};
@@ -30,9 +39,8 @@ use std::ops::Range;
 
 /// Space between pages, and above the first and below the last.
 pub const PAGE_GAP: f32 = 12.0;
-/// Space kept clear on each side of a page that has been fitted to the
-/// window.
-const SIDE_MARGIN: f32 = 12.0;
+/// Space kept clear on each side of the widest page.
+pub const SIDE_MARGIN: f32 = 12.0;
 /// US Letter, standing in for a page whose own size is unusable (zero,
 /// negative or not a number). The row has to have *some* height, and a
 /// wrong one is better than a division by zero.
@@ -41,67 +49,118 @@ pub const FALLBACK_PAGE_SIZE: PageSize = PageSize {
     height_pt: 792.0,
 };
 
-/// A reading position that does not depend on zoom or window width.
+/// A point on a page, which stays the same point at any zoom level and
+/// in any window.
 ///
-/// `frac` is measured from one gap above the page's top edge, in page
-/// heights, so 0.0 is exactly where a page turn lands: the page's top
-/// with its margin showing above it.
+/// `frac` is measured down from the page's top edge in page heights,
+/// `xfrac` across from its left edge in page widths. Both may fall
+/// outside 0..1 for a point in the gap beside or below a page.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Anchor {
     pub page: usize,
     pub frac: f32,
+    pub xfrac: f32,
 }
 
 impl Anchor {
+    /// The top of a page, at its horizontal middle.
     pub fn top_of(page: usize) -> Self {
-        Self { page, frac: 0.0 }
+        Self {
+            page,
+            frac: 0.0,
+            xfrac: 0.5,
+        }
     }
 }
 
-/// Where every page sits, for one zoom level and one window width.
+/// Which way a page is fitted to the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// The whole page visible at once.
+    Page,
+    /// The page as wide as the window, however tall that makes it.
+    Width,
+}
+
+/// The zoom level at which a page of `size` fits a window of `avail`.
 ///
-/// Coordinates are in points from the top of the column. A page wider
-/// than the window is shrunk to fit it, the same rule the paged view
-/// applies, so there is never anything to scroll sideways for.
+/// Rounded down to a thousandth. Unrounded, a window dragged one pixel
+/// wider is a new zoom level, and every zoom level is a fresh render of
+/// every page on screen. Down rather than to nearest, so that rounding
+/// can never push a fitted page a fraction of a point past the edge and
+/// summon a scrollbar for it.
+pub fn fit_scale(fit: Fit, size: PageSize, avail: egui::Vec2) -> f64 {
+    let size = usable(size).unwrap_or(FALLBACK_PAGE_SIZE);
+    let by_width = (avail.x - 2.0 * SIDE_MARGIN).max(1.0) as f64 / size.width_pt;
+    let by_height = (avail.y - 2.0 * PAGE_GAP).max(1.0) as f64 / size.height_pt;
+    let scale = match fit {
+        Fit::Width => by_width,
+        Fit::Page => by_width.min(by_height),
+    };
+    (scale * 1000.0).floor() / 1000.0
+}
+
+/// The size to fit a whole document by: as wide as its widest page and
+/// as tall as its tallest, so that fitting it fits every page.
+pub fn bounding_size(pages: &[PageSize]) -> PageSize {
+    let mut bound = PageSize {
+        width_pt: 0.0,
+        height_pt: 0.0,
+    };
+    for size in pages.iter().filter_map(|p| usable(*p)) {
+        bound.width_pt = bound.width_pt.max(size.width_pt);
+        bound.height_pt = bound.height_pt.max(size.height_pt);
+    }
+    usable(bound).unwrap_or(FALLBACK_PAGE_SIZE)
+}
+
+fn usable(size: PageSize) -> Option<PageSize> {
+    let ok = |v: f64| v.is_finite() && v >= 1.0;
+    (ok(size.width_pt) && ok(size.height_pt)).then_some(size)
+}
+
+/// Where every page sits, for one zoom level and one window size.
+///
+/// Coordinates are in points from the top-left of the column. The
+/// column is as wide as the window or the widest page, whichever is
+/// more, and each page is centred in it. A document shorter than the
+/// window is centred vertically too, which is what puts a single fitted
+/// page in the middle of the window rather than at the top of it.
 pub struct Layout {
     tops: Vec<f32>,
     sizes: Vec<egui::Vec2>,
-    shrunk: Vec<bool>,
     width: f32,
     total: f32,
 }
 
 impl Layout {
-    pub fn new(pages: &[PageSize], scale: f64, width: f32) -> Self {
-        let max_w = (width - 2.0 * SIDE_MARGIN).max(1.0);
+    pub fn new(pages: &[PageSize], scale: f64, avail: egui::Vec2) -> Self {
         let mut tops = Vec::with_capacity(pages.len());
         let mut sizes = Vec::with_capacity(pages.len());
-        let mut shrunk = Vec::with_capacity(pages.len());
+        let mut widest = 0.0_f32;
         let mut y = PAGE_GAP;
         for page in pages {
-            let usable = |p: &PageSize| {
-                let (w, h) = ((p.width_pt * scale) as f32, (p.height_pt * scale) as f32);
-                (w.is_finite() && h.is_finite() && w >= 1.0 && h >= 1.0).then_some((w, h))
-            };
-            let (mut w, mut h) = usable(page)
-                .or_else(|| usable(&FALLBACK_PAGE_SIZE))
-                .unwrap_or((max_w, max_w));
-            let fit = w > max_w;
-            if fit {
-                h *= max_w / w;
-                w = max_w;
-            }
+            let size = usable(*page).unwrap_or(FALLBACK_PAGE_SIZE);
+            let w = ((size.width_pt * scale) as f32).max(1.0);
+            let h = ((size.height_pt * scale) as f32).max(1.0);
             tops.push(y);
             sizes.push(vec2(w, h));
-            shrunk.push(fit);
+            widest = widest.max(w);
             y += h + PAGE_GAP;
+        }
+        let mut total = y;
+        if total < avail.y {
+            let pad = (avail.y - total) / 2.0;
+            for top in &mut tops {
+                *top += pad;
+            }
+            total = avail.y;
         }
         Self {
             tops,
             sizes,
-            shrunk,
-            width,
-            total: y,
+            width: avail.x.max(widest + 2.0 * SIDE_MARGIN),
+            total,
         }
     }
 
@@ -110,14 +169,17 @@ impl Layout {
         self.total
     }
 
+    /// Width of the whole column: the window's, unless a page is wider.
+    pub fn width(&self) -> f32 {
+        self.width
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tops.is_empty()
     }
 
-    /// Whether the page was shrunk to fit the window, and so is drawn
-    /// smaller than it was rendered.
-    pub fn is_shrunk(&self, page: usize) -> bool {
-        self.shrunk[page]
+    fn left(&self, page: usize) -> f32 {
+        (self.width - self.sizes[page].x) / 2.0
     }
 
     /// The page whose row `y` falls in. A row runs from a page's top
@@ -165,25 +227,30 @@ impl Layout {
         best.0
     }
 
-    /// The scroll offset that puts `anchor` at the top of the window.
-    pub fn offset_of(&self, anchor: Anchor) -> f32 {
+    /// Where in the column `anchor` is.
+    pub fn point_of(&self, anchor: Anchor) -> egui::Vec2 {
         if self.is_empty() {
-            return 0.0;
+            return egui::Vec2::ZERO;
         }
         let page = anchor.page.min(self.tops.len() - 1);
-        self.tops[page] - PAGE_GAP + anchor.frac * self.sizes[page].y
+        let size = self.sizes[page];
+        vec2(
+            self.left(page) + anchor.xfrac * size.x,
+            self.tops[page] + anchor.frac * size.y,
+        )
     }
 
-    /// The inverse of [`Layout::offset_of`].
-    pub fn anchor_at(&self, offset: f32) -> Anchor {
+    /// The inverse of [`Layout::point_of`].
+    pub fn anchor_at(&self, point: egui::Vec2) -> Anchor {
         if self.is_empty() {
             return Anchor::top_of(0);
         }
-        let y = offset.max(0.0) + PAGE_GAP;
-        let page = self.page_at(y);
+        let page = self.page_at(point.y);
+        let size = self.sizes[page];
         Anchor {
             page,
-            frac: (y - self.tops[page]) / self.sizes[page].y,
+            frac: (point.y - self.tops[page]) / size.y,
+            xfrac: (point.x - self.left(page)) / size.x,
         }
     }
 
@@ -212,13 +279,9 @@ impl Layout {
     /// top-left corner currently is. `origin` is what carries the scroll
     /// position: it moves up as the reader scrolls down.
     pub fn page_rect(&self, page: usize, origin: Pos2) -> Rect {
-        let size = self.sizes[page];
         Rect::from_min_size(
-            pos2(
-                origin.x + ((self.width - size.x) / 2.0).max(0.0),
-                origin.y + self.tops[page],
-            ),
-            size,
+            pos2(origin.x + self.left(page), origin.y + self.tops[page]),
+            self.sizes[page],
         )
     }
 }
@@ -259,22 +322,28 @@ pub struct Shown {
     pub current_page: usize,
     /// Whether the reader last moved down the document rather than up.
     pub forward: bool,
+    /// Whether there is more of the column than fits the window's
+    /// height -- that is, whether scrolling vertically does anything.
+    pub overflows: bool,
 }
 
-/// Identifies a layout: zoom, window width, page count. If none of the
-/// three has changed, neither has any page's position.
-type LayoutKey = (u64, u32, usize);
+/// Identifies a layout: zoom, window size, and which pages. If none of
+/// them has changed, neither has any page's position.
+type LayoutKey = (u64, u32, u32, usize, usize);
 
 /// The scroll area, and the reading position in it.
 pub struct View {
-    anchor: Anchor,
-    offset: f32,
+    /// Salt for the scroll area's id, so the paged and the continuous
+    /// view do not share one scroll position between them.
+    name: &'static str,
+    offset: egui::Vec2,
     forward: bool,
     layout: Option<(LayoutKey, Layout)>,
-    /// Set when the scroll offset has to be recomputed from `anchor`
-    /// instead of the other way round: the layout changed under it, or
-    /// something asked to go to a particular page.
-    reanchor: bool,
+    /// A point to put somewhere on the next frame: the anchor, and where
+    /// in the window it should end up. `None` for the place means where
+    /// a page turn puts a page's top: centred, one gap below the top of
+    /// the window, so its margin shows above it.
+    pending: Option<(Anchor, Option<egui::Vec2>)>,
     /// Page turns asked for since the last frame; negative is backwards.
     page_steps: i32,
     /// Finer movement asked for since the last frame, in window heights.
@@ -283,27 +352,24 @@ pub struct View {
     scroller: Scroller,
 }
 
-impl Default for View {
-    fn default() -> Self {
+impl View {
+    pub fn new(name: &'static str) -> Self {
         Self {
-            anchor: Anchor::top_of(0),
-            offset: 0.0,
+            name,
+            offset: egui::Vec2::ZERO,
             forward: true,
             layout: None,
-            reanchor: true,
+            pending: Some((Anchor::top_of(0), None)),
             page_steps: 0,
             scroll_screens: 0.0,
             scroller: Scroller::default(),
         }
     }
-}
 
-impl View {
     /// Puts the top of `page` at the top of the window on the next
     /// frame.
     pub fn go_to_page(&mut self, page: usize) {
-        self.anchor = Anchor::top_of(page);
-        self.reanchor = true;
+        self.pending = Some((Anchor::top_of(page), None));
     }
 
     /// Moves by whole pages on the next frame.
@@ -317,37 +383,69 @@ impl View {
     }
 
     /// Lays the column out into `ui` and calls `paint` for each page on
-    /// screen with the page's index, its rectangle, and whether it has
-    /// been shrunk to fit.
+    /// screen with the page's index and its rectangle.
+    ///
+    /// `focus` is the point on screen that should stay still if the zoom
+    /// level has changed since the last frame -- the pointer, for a
+    /// pinch. Without one, what is at the top of the window stays there.
+    /// `line_pt` is how far one wheel notch scrolls.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         pages: &[PageSize],
         scale: f64,
-        mut paint: impl FnMut(&egui::Painter, usize, Rect, bool),
+        focus: Option<Pos2>,
+        line_pt: f32,
+        mut paint: impl FnMut(&egui::Painter, usize, Rect),
     ) -> Shown {
         let avail = ui.available_size();
-        let key: LayoutKey = (scale.to_bits(), avail.x.to_bits(), pages.len());
+        let window = Rect::from_min_size(ui.max_rect().min, avail);
+        // Where a page's top edge rests after a page turn. Also the point
+        // held still by a zoom that has no pointer to go by -- and for
+        // the same reason: it is the one point that is exactly on a page
+        // edge after a turn, so holding it keeps that edge exactly
+        // where it was, where holding the window's own top edge would
+        // hold a point in the gap, which does not scale with the page.
+        let top_centre = vec2(avail.x / 2.0, PAGE_GAP);
+        let key: LayoutKey = (
+            scale.to_bits(),
+            avail.x.to_bits(),
+            avail.y.to_bits(),
+            pages.as_ptr() as usize,
+            pages.len(),
+        );
         if self.layout.as_ref().map(|(k, _)| *k) != Some(key) {
-            self.layout = Some((key, Layout::new(pages, scale, avail.x)));
-            // Every page has just moved. The offset egui is holding now
-            // points at some other part of the document entirely.
-            self.reanchor = true;
+            // Every page is about to move. Before the old layout goes,
+            // ask it what is at the point that should stay put, so the
+            // new one can be scrolled to put the same thing there.
+            if self.pending.is_none() {
+                let hold = focus
+                    .filter(|p| window.contains(*p))
+                    .map_or(top_centre, |p| p - window.min);
+                if let Some((_, old)) = &self.layout {
+                    self.pending = Some((old.anchor_at(self.offset + hold), Some(hold)));
+                }
+            }
+            self.layout = Some((key, Layout::new(pages, scale, avail)));
         }
         let layout = &self.layout.as_ref().expect("set just above").1;
-        let max_offset = (layout.total() - avail.y).max(0.0);
+        let max_offset = vec2(
+            (layout.width() - avail.x).max(0.0),
+            (layout.total() - avail.y).max(0.0),
+        );
 
         let mut target = self.offset;
-        let mut forced = std::mem::take(&mut self.reanchor);
-        if forced {
-            target = layout.offset_of(self.anchor);
+        let mut forced = false;
+        if let Some((anchor, place)) = self.pending.take() {
+            target = layout.point_of(anchor) - place.unwrap_or(top_centre);
+            forced = true;
         }
         let steps = std::mem::take(&mut self.page_steps);
         for _ in 0..steps.unsigned_abs() {
-            target = if steps > 0 {
-                layout.next_page_offset(target)
+            target.y = if steps > 0 {
+                layout.next_page_offset(target.y)
             } else {
-                layout.prev_page_offset(target)
+                layout.prev_page_offset(target.y)
             };
             forced = true;
         }
@@ -364,14 +462,14 @@ impl View {
         // The wheel is taken here, before the scroll area can have it.
         // egui would turn it into its own short eased step; `Scroller`
         // turns it into something that feels like a browser. The scroll
-        // area is left with the scrollbar and drag-to-scroll, which it
-        // does well.
-        let (now, dt, wheel) = crate::scroll::take_wheel(ui);
+        // area is left with the scrollbars, sideways scrolling and
+        // drag-to-pan, which it does well.
+        let (now, dt, wheel) = crate::scroll::take_wheel(ui, line_pt);
         let moved = self.scroller.step(now, dt, &wheel);
         if moved != 0.0 {
-            target += moved;
+            target.y += moved;
             forced = true;
-            if target <= 0.0 || target >= max_offset {
+            if target.y <= 0.0 || target.y >= max_offset.y {
                 // An end of the document. Anything still owed would
                 // otherwise sit there and be paid out the moment the
                 // reader scrolled back the other way.
@@ -384,46 +482,41 @@ impl View {
             ui.ctx().request_repaint();
         }
 
-        let mut area = egui::ScrollArea::vertical()
-            .id_salt("continuous_pages")
+        let mut area = egui::ScrollArea::both()
+            .id_salt(self.name)
             .auto_shrink([false, false]);
         if forced {
-            area = area.vertical_scroll_offset(target.clamp(0.0, max_offset));
+            area = area.scroll_offset(target.clamp(egui::Vec2::ZERO, max_offset));
         }
         let out = area.show_viewport(ui, |ui, viewport| {
             // The column's top-left corner *on screen*. egui has already
-            // moved it up by the scroll offset, so adding a page's
-            // position in the column to it gives where that page is now.
-            // The broken version of this view placed pages at their
-            // column position as if it were a screen position, which is
-            // right only while nothing has been scrolled.
+            // moved it by the scroll offset, so adding a page's position
+            // in the column to it gives where that page is now. The
+            // broken version of this view placed pages at their column
+            // position as if it were a screen position, which is right
+            // only while nothing has been scrolled.
             let origin = ui.max_rect().min;
             ui.allocate_rect(
-                Rect::from_min_size(origin, vec2(avail.x, layout.total())),
+                Rect::from_min_size(origin, vec2(layout.width(), layout.total())),
                 egui::Sense::hover(),
             );
             let visible = layout.visible(viewport.min.y, viewport.max.y);
             for page in visible.clone() {
-                paint(
-                    ui.painter(),
-                    page,
-                    layout.page_rect(page, origin),
-                    layout.is_shrunk(page),
-                );
+                paint(ui.painter(), page, layout.page_rect(page, origin));
             }
             visible
         });
 
-        let offset = out.state.offset.y;
-        if offset != self.offset {
-            self.forward = offset > self.offset;
+        let offset = out.state.offset;
+        if offset.y != self.offset.y {
+            self.forward = offset.y > self.offset.y;
         }
         self.offset = offset;
-        self.anchor = layout.anchor_at(offset);
         Shown {
             visible: out.inner,
-            current_page: layout.most_visible(offset, offset + avail.y),
+            current_page: layout.most_visible(offset.y, offset.y + avail.y),
             forward: self.forward,
+            overflows: max_offset.y > 0.5,
         }
     }
 }
@@ -437,10 +530,19 @@ mod tests {
         height_pt: 792.0,
     };
 
-    /// Ten letter pages at 1:1 in a window wide enough not to shrink
-    /// them: rows are 792 tall, 804 apart, the first at 12.
+    /// A window 1000 wide and 600 tall.
+    const WINDOW: egui::Vec2 = vec2(1000.0, 600.0);
+
+    /// Ten letter pages at 1:1: rows are 792 tall, 804 apart, the first
+    /// at 12.
     fn ten() -> Layout {
-        Layout::new(&[LETTER; 10], 1.0, 1000.0)
+        Layout::new(&[LETTER; 10], 1.0, WINDOW)
+    }
+
+    /// The scroll offset that puts the top of `page` at the top of the
+    /// window.
+    fn top_offset(l: &Layout, page: usize) -> f32 {
+        l.point_of(Anchor::top_of(page)).y - PAGE_GAP
     }
 
     #[test]
@@ -451,13 +553,72 @@ mod tests {
         assert_eq!(l.total(), PAGE_GAP + 10.0 * (792.0 + PAGE_GAP));
     }
 
+    /// Nothing is shrunk to fit any more: a page wider than the window
+    /// keeps its size and the column grows to hold it, margins and all.
     #[test]
-    fn a_page_wider_than_the_window_is_shrunk_in_proportion() {
-        let l = Layout::new(&[LETTER], 2.0, 636.0);
-        // 1224 wide into 612 of room: exactly half, so half the height.
-        assert!(l.is_shrunk(0));
-        assert_eq!(l.sizes[0], vec2(612.0, 792.0));
-        assert!(!ten().is_shrunk(0));
+    fn a_page_wider_than_the_window_widens_the_column_instead_of_shrinking() {
+        let l = Layout::new(&[LETTER], 2.0, vec2(636.0, 600.0));
+        assert_eq!(l.sizes[0], vec2(1224.0, 1584.0));
+        assert_eq!(l.width(), 1224.0 + 2.0 * SIDE_MARGIN);
+        // And one that fits leaves the column as wide as the window.
+        assert_eq!(ten().width(), WINDOW.x);
+    }
+
+    #[test]
+    fn a_document_shorter_than_the_window_sits_in_the_middle_of_it() {
+        let l = Layout::new(&[LETTER], 0.5, WINDOW);
+        // 396 tall in 600: 102 above and below.
+        assert_eq!(l.tops[0], 102.0);
+        assert_eq!(l.total(), WINDOW.y);
+        let rect = l.page_rect(0, Pos2::ZERO);
+        assert_eq!(rect.center(), pos2(500.0, 300.0));
+    }
+
+    #[test]
+    fn fit_page_shows_the_whole_page_and_fit_width_fills_the_window_across() {
+        let page = fit_scale(Fit::Page, LETTER, WINDOW);
+        let l = Layout::new(&[LETTER], page, WINDOW);
+        // Limited by height here, and nothing left to scroll either way.
+        assert!(l.sizes[0].y <= WINDOW.y - 2.0 * PAGE_GAP);
+        assert!(l.sizes[0].y > WINDOW.y - 2.0 * PAGE_GAP - 2.0);
+        assert_eq!((l.total(), l.width()), (WINDOW.y, WINDOW.x));
+
+        let width = fit_scale(Fit::Width, LETTER, WINDOW);
+        let l = Layout::new(&[LETTER], width, WINDOW);
+        assert!(l.sizes[0].x <= WINDOW.x - 2.0 * SIDE_MARGIN);
+        assert!(l.sizes[0].x > WINDOW.x - 2.0 * SIDE_MARGIN - 2.0);
+        // No sideways scrolling, but plenty of down.
+        assert_eq!(l.width(), WINDOW.x);
+        assert!(l.total() > WINDOW.y);
+    }
+
+    /// A tall narrow window: fit-page is then limited by width, and is
+    /// the same thing as fit-width.
+    #[test]
+    fn fit_page_is_limited_by_whichever_side_runs_out_first() {
+        let tall = vec2(400.0, 2000.0);
+        assert_eq!(
+            fit_scale(Fit::Page, LETTER, tall),
+            fit_scale(Fit::Width, LETTER, tall)
+        );
+    }
+
+    #[test]
+    fn a_fit_is_stable_against_a_window_a_hair_wider() {
+        let a = fit_scale(Fit::Width, LETTER, vec2(1002.0, 600.0));
+        let b = fit_scale(Fit::Width, LETTER, vec2(1002.3, 600.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_document_is_fitted_by_its_widest_and_tallest_page() {
+        let wide = PageSize {
+            width_pt: 792.0,
+            height_pt: 612.0,
+        };
+        let bound = bounding_size(&[LETTER, wide, LETTER]);
+        assert_eq!((bound.width_pt, bound.height_pt), (792.0, 792.0));
+        assert_eq!(bounding_size(&[]).width_pt, FALLBACK_PAGE_SIZE.width_pt);
     }
 
     /// Mixed sizes are the reason rows are not a multiplication: a
@@ -468,7 +629,7 @@ mod tests {
             width_pt: 792.0,
             height_pt: 612.0,
         };
-        let l = Layout::new(&[LETTER, wide, LETTER], 1.0, 1000.0);
+        let l = Layout::new(&[LETTER, wide, LETTER], 1.0, WINDOW);
         assert_eq!(l.tops[2] - l.tops[1], 612.0 + PAGE_GAP);
     }
 
@@ -478,7 +639,7 @@ mod tests {
             width_pt: 0.0,
             height_pt: f64::NAN,
         };
-        let l = Layout::new(&[broken, LETTER], 1.0, 1000.0);
+        let l = Layout::new(&[broken, LETTER], 1.0, WINDOW);
         assert_eq!(l.sizes[0], vec2(612.0, 792.0));
         assert!(l.total().is_finite());
     }
@@ -502,7 +663,7 @@ mod tests {
         assert_eq!(l.visible(808.0, 1400.0), 1..2);
         // Far past the end: nothing, rather than a panic.
         assert_eq!(l.visible(1.0e9, 2.0e9), 10..10);
-        assert_eq!(Layout::new(&[], 1.0, 1000.0).visible(0.0, 600.0), 0..0);
+        assert_eq!(Layout::new(&[], 1.0, WINDOW).visible(0.0, 600.0), 0..0);
     }
 
     #[test]
@@ -513,41 +674,47 @@ mod tests {
         assert_eq!(l.most_visible(704.0, 1304.0), 1);
         // Zoomed out so several fit: the first whole one, which is the
         // one a page turn just put at the top.
-        let small = Layout::new(&[LETTER; 10], 0.2, 1000.0);
-        let top = small.offset_of(Anchor::top_of(3));
+        let small = Layout::new(&[LETTER; 10], 0.2, WINDOW);
+        let top = top_offset(&small, 3);
         assert_eq!(small.most_visible(top, top + 600.0), 3);
     }
 
     /// The property the anchor exists for.
     #[test]
-    fn a_position_survives_a_zoom_and_a_resize() {
+    fn a_point_on_a_page_survives_a_zoom_and_a_resize() {
         let before = ten();
-        let offset = before.offset_of(Anchor {
+        let anchor = Anchor {
             page: 4,
             frac: 0.25,
-        });
-        let anchor = before.anchor_at(offset);
-        assert_eq!(anchor.page, 4);
-        assert!((anchor.frac - 0.25).abs() < 1e-4);
+            xfrac: 0.8,
+        };
+        let found = before.anchor_at(before.point_of(anchor));
+        assert_eq!(found.page, 4);
+        assert!((found.frac - 0.25).abs() < 1e-4);
+        assert!((found.xfrac - 0.8).abs() < 1e-4);
 
-        // Zoomed in, in a narrower window that now shrinks the page.
-        let after = Layout::new(&[LETTER; 10], 1.5, 700.0);
-        let moved = after.offset_of(anchor);
+        // Zoomed in, in a window now narrower than the page.
+        let after = Layout::new(&[LETTER; 10], 1.5, vec2(700.0, 500.0));
+        let moved = after.point_of(found);
         let back = after.anchor_at(moved);
         assert_eq!(back.page, 4);
         assert!((back.frac - 0.25).abs() < 1e-4);
-        // A quarter of the way down page 4, in the new geometry.
-        assert!((moved - (after.tops[4] - PAGE_GAP + 0.25 * after.sizes[4].y)).abs() < 0.01);
+        assert!((back.xfrac - 0.8).abs() < 1e-4);
+        // A quarter of the way down page 4 and four fifths across it,
+        // in the new geometry.
+        let rect = after.page_rect(4, Pos2::ZERO);
+        assert!((moved.y - (rect.min.y + 0.25 * rect.height())).abs() < 0.01);
+        assert!((moved.x - (rect.min.x + 0.8 * rect.width())).abs() < 0.01);
     }
 
     #[test]
     fn a_page_turn_lands_exactly_on_a_page_top_and_stays_there_through_a_zoom() {
         let l = ten();
-        let at = l.offset_of(Anchor::top_of(6));
-        assert_eq!(at, l.tops[6] - PAGE_GAP);
+        let at = l.point_of(Anchor::top_of(6));
+        assert_eq!(at.y, l.tops[6]);
         assert_eq!(l.anchor_at(at), Anchor::top_of(6));
-        let zoomed = Layout::new(&[LETTER; 10], 1.2, 2000.0);
-        assert_eq!(zoomed.offset_of(l.anchor_at(at)), zoomed.tops[6] - PAGE_GAP);
+        let zoomed = Layout::new(&[LETTER; 10], 1.2, vec2(2000.0, 600.0));
+        assert_eq!(zoomed.point_of(l.anchor_at(at)).y, zoomed.tops[6]);
     }
 
     #[test]
@@ -604,8 +771,11 @@ mod tests {
         pages: &[PageSize],
         scale: f64,
     ) -> (Shown, Vec<(usize, Rect)>) {
-        frame_with(ctx, view, pages, scale, 0.0, Vec::new())
+        frame_with(ctx, view, pages, scale, 0.0, Vec::new(), None)
     }
+
+    /// One wheel notch, in points.
+    const STEP: f32 = 30.0;
 
     /// The same, at a given time and with input events.
     fn frame_with(
@@ -615,6 +785,7 @@ mod tests {
         scale: f64,
         time: f64,
         events: Vec<egui::Event>,
+        focus: Option<Pos2>,
     ) -> (Shown, Vec<(usize, Rect)>) {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
@@ -629,7 +800,7 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| {
-                    shown = Some(view.show(ui, pages, scale, |_, page, rect, _| {
+                    shown = Some(view.show(ui, pages, scale, focus, STEP, |_, page, rect| {
                         painted.push((page, rect));
                     }));
                 });
@@ -640,7 +811,7 @@ mod tests {
     #[test]
     fn a_fresh_view_starts_at_the_top_of_the_first_page() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let (shown, painted) = frame(&ctx, &mut view, &[LETTER; 10], 1.0);
         assert_eq!(shown.current_page, 0);
         assert_eq!(painted[0].0, 0);
@@ -655,7 +826,7 @@ mod tests {
     #[test]
     fn a_scrolled_page_is_drawn_where_the_scroll_put_it() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         frame(&ctx, &mut view, &pages, 1.0);
         view.go_to_page(5);
@@ -678,7 +849,7 @@ mod tests {
     #[test]
     fn page_turns_walk_forward_and_back() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         frame(&ctx, &mut view, &pages, 1.0);
         view.turn_pages(1);
@@ -696,7 +867,7 @@ mod tests {
     #[test]
     fn zooming_keeps_the_same_page_at_the_top() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         frame(&ctx, &mut view, &pages, 1.0);
         view.go_to_page(7);
@@ -712,12 +883,12 @@ mod tests {
     #[test]
     fn a_new_view_ignores_the_previous_one_s_scroll_position() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         frame(&ctx, &mut view, &pages, 1.0);
         view.go_to_page(8);
         frame(&ctx, &mut view, &pages, 1.0);
-        let mut fresh = View::default();
+        let mut fresh = View::new("test");
         let (shown, _) = frame(&ctx, &mut fresh, &pages, 1.0);
         assert_eq!(shown.current_page, 0);
     }
@@ -742,8 +913,15 @@ mod tests {
         let mut last = (0, 0.0);
         for _ in 0..600 {
             *time += 1.0 / 60.0;
-            let (_, painted) =
-                frame_with(ctx, view, pages, 1.0, *time, std::mem::take(&mut events));
+            let (_, painted) = frame_with(
+                ctx,
+                view,
+                pages,
+                1.0,
+                *time,
+                std::mem::take(&mut events),
+                None,
+            );
             last = (painted[0].0, painted[0].1.min.y);
             if !view.scroller.is_active() {
                 break;
@@ -753,9 +931,9 @@ mod tests {
     }
 
     #[test]
-    fn a_wheel_notch_scrolls_a_browser_s_worth_and_glides_there() {
+    fn a_wheel_notch_scrolls_exactly_one_step_and_eases_there() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         let mut time = 0.0;
         let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
@@ -763,16 +941,16 @@ mod tests {
 
         // One frame in, it has started but not arrived.
         time += 1.0 / 60.0;
-        let (_, painted) = frame_with(&ctx, &mut view, &pages, 1.0, time, vec![wheel(1.0)]);
+        let (_, painted) = frame_with(&ctx, &mut view, &pages, 1.0, time, vec![wheel(1.0)], None);
         let first = PAGE_GAP - painted[0].1.min.y;
         assert!(
-            first > 0.0 && first < crate::scroll::LINE_PT / 2.0,
+            first > 0.0 && first < STEP / 2.0,
             "moved {first} in the first frame"
         );
         let (page, top) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
         assert_eq!(page, 0);
         assert!(
-            (PAGE_GAP - top - crate::scroll::LINE_PT).abs() < 1.0,
+            (PAGE_GAP - top - STEP).abs() < 1.0,
             "ended {} down",
             PAGE_GAP - top
         );
@@ -781,7 +959,7 @@ mod tests {
     #[test]
     fn a_touchpad_flick_crosses_pages() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         let mut time = 0.0;
         let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
@@ -794,7 +972,7 @@ mod tests {
                 delta: vec2(0.0, -80.0),
                 modifiers: egui::Modifiers::NONE,
             };
-            frame_with(&ctx, &mut view, &pages, 1.0, time, vec![event]);
+            frame_with(&ctx, &mut view, &pages, 1.0, time, vec![event], None);
         }
         let (page, _) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
         assert!(page >= 3, "a flick only reached page {page}");
@@ -803,7 +981,7 @@ mod tests {
     #[test]
     fn scrolling_up_at_the_top_leaves_nothing_owed() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         let mut time = 0.0;
         let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
@@ -816,7 +994,7 @@ mod tests {
     #[test]
     fn the_arrow_key_nudge_glides_a_fifth_of_the_window() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 10];
         let mut time = 0.0;
         run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
@@ -825,10 +1003,88 @@ mod tests {
         assert!((PAGE_GAP - top - 0.2 * SCREEN.y).abs() < 1.0);
     }
 
+    /// Ten notches are ten steps: what makes the wheel something you
+    /// can land on a line with.
+    #[test]
+    fn ten_quick_notches_scroll_exactly_ten_steps() {
+        let ctx = egui::Context::default();
+        let mut view = View::new("test");
+        let pages = [LETTER; 10];
+        let mut time = 0.0;
+        let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
+        run_until_still(&ctx, &mut view, &pages, &mut time, vec![hover]);
+        for _ in 0..10 {
+            time += 1.0 / 60.0;
+            frame_with(&ctx, &mut view, &pages, 1.0, time, vec![wheel(1.0)], None);
+        }
+        let (_, top) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
+        assert!(
+            (PAGE_GAP - top - 10.0 * STEP).abs() < 1.0,
+            "ended {} down",
+            PAGE_GAP - top
+        );
+    }
+
+    /// What a pinch needs: the point under the pointer is the same
+    /// point of the same page after the zoom as before it.
+    #[test]
+    fn zooming_about_a_point_keeps_that_point_still() {
+        let ctx = egui::Context::default();
+        // As the app has them: drawn over the page, not beside it. A
+        // scrollbar that takes room of its own makes the window a bar
+        // narrower the moment there is something to scroll sideways.
+        ctx.style_mut(|s| s.spacing.scroll.floating = true);
+        let mut view = View::new("test");
+        let pages = [LETTER; 10];
+        frame(&ctx, &mut view, &pages, 1.0);
+        view.go_to_page(4);
+        let (_, before) = frame(&ctx, &mut view, &pages, 1.0);
+        let pointer = pos2(300.0, 400.0);
+        let (page, rect) = before[0];
+        let was = (pointer - rect.min) / rect.size();
+
+        let (_, after) = frame_with(&ctx, &mut view, &pages, 2.0, 0.0, vec![], Some(pointer));
+        let (_, rect) = *after.iter().find(|(p, _)| *p == page).expect("still shown");
+        let now = (pointer - rect.min) / rect.size();
+        assert!((was - now).length() < 1e-3, "{was:?} became {now:?}");
+        // The page is now 1224 wide in an 800 window, so it has had to
+        // scroll sideways to do that.
+        assert!(rect.min.x < 0.0);
+    }
+
+    /// Without a pointer to hold on to, the top of the window stays
+    /// where it is and the page stays centred.
+    #[test]
+    fn a_page_zoomed_wider_than_the_window_starts_out_centred() {
+        let ctx = egui::Context::default();
+        let mut view = View::new("test");
+        let pages = [LETTER; 10];
+        frame(&ctx, &mut view, &pages, 1.0);
+        let (_, painted) = frame(&ctx, &mut view, &pages, 2.0);
+        assert!((painted[0].1.center().x - SCREEN.x / 2.0).abs() < 0.01);
+        assert!((painted[0].1.min.y - PAGE_GAP).abs() < 0.01);
+    }
+
+    /// The paged view is this view over a one-page slice: a different
+    /// slice is a different page, and starts at its top.
+    #[test]
+    fn a_one_page_view_reports_whether_there_is_anything_to_scroll() {
+        let ctx = egui::Context::default();
+        let mut view = View::new("test");
+        let pages = [LETTER; 10];
+        let fitted = fit_scale(Fit::Page, LETTER, SCREEN);
+        let (shown, painted) = frame(&ctx, &mut view, &pages[3..4], fitted);
+        assert!(!shown.overflows);
+        assert!((painted[0].1.center() - (SCREEN / 2.0).to_pos2()).length() < 1.0);
+        let wide = fit_scale(Fit::Width, LETTER, SCREEN);
+        let (shown, _) = frame(&ctx, &mut view, &pages[3..4], wide);
+        assert!(shown.overflows);
+    }
+
     #[test]
     fn the_end_of_the_document_is_as_far_as_it_scrolls() {
         let ctx = egui::Context::default();
-        let mut view = View::default();
+        let mut view = View::new("test");
         let pages = [LETTER; 3];
         frame(&ctx, &mut view, &pages, 1.0);
         for _ in 0..10 {

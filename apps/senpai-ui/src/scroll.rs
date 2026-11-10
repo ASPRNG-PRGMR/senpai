@@ -1,31 +1,34 @@
 //! How scrolling *feels*: turning wheel and touchpad input into motion.
 //!
-//! egui's own handling is one rule for everything -- a wheel notch is 50
-//! points, eased -- and nothing carries on once the input stops. In a
-//! document that reads as a row of small identical steps, the same as
-//! holding an arrow key, and a flick of the touchpad goes exactly as far
-//! as the fingers did. A browser does three things differently, and
-//! this module is those three things:
+//! The rule this is built on is that the page goes exactly as far as
+//! it was told to. One notch of the wheel is one fixed step, the same
+//! step every time, however fast the notches come: ten of them are ten
+//! steps, not ten steps and a bonus for hurry. An earlier version made
+//! quick notches travel further, which let a spin of the wheel cross
+//! pages and made it impossible to land on a line -- and under Wine,
+//! where a touchpad arrives as a rapid run of whole notches, it turned
+//! every two-finger drag into a lurch. How big the step is belongs to
+//! the reader (Options -> Wheel step), not to a heuristic.
 //!
-//! - **A wheel notch travels further and glides.** About a hundred
-//!   points, eased out over a fifth of a second, so the page moves
-//!   rather than jumps. Notches in quick succession each go a little
-//!   further than the last, which is what lets a spin of the wheel
-//!   cross pages instead of paragraphs.
+//! Three things happen to input here, and no more:
+//!
+//! - **A wheel notch is eased.** The step is fixed; it is spread over a
+//!   few frames so the eye can follow the text instead of losing its
+//!   place in a jump.
 //! - **A touchpad is followed directly.** Fine-grained input is applied
 //!   almost as it arrives; easing it would put the page behind the
 //!   fingers.
 //! - **A flick keeps going.** When fine-grained input stops while still
 //!   moving fast, the page coasts on at that speed and slows down on
-//!   its own. Flick again while it is coasting and the speeds add, so
-//!   three flicks cover a chapter.
+//!   its own. Flick again while it is coasting and the speeds add.
+//!   Only fine-grained input can do this: a device that reports whole
+//!   notches has no speed to carry on at, only a count.
 //!
 //! The coasting is done here because nothing below does it. On Linux
 //! the toolkit is expected to (GTK and the browsers each implement
-//! their own); under Wine no inertia arrives from anywhere. On Windows
-//! proper the touchpad driver sends its own decaying tail of events,
-//! which simply looks like input that slowed to a stop, and so starts
-//! no second coast on top.
+//! their own). On Windows proper the touchpad driver sends its own
+//! decaying tail of events, which simply looks like input that slowed
+//! to a stop, and so starts no second coast on top.
 //!
 //! Nothing in here knows about egui's scroll area, or about time except
 //! as numbers it is handed, so all of it can be tested as arithmetic.
@@ -33,11 +36,45 @@
 use eframe::egui;
 use std::collections::VecDeque;
 
-/// How far one wheel notch moves, in points.
-pub const LINE_PT: f32 = 100.0;
+/// How far one wheel notch moves. The reader's choice, remembered
+/// between runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WheelStep {
+    /// About a line of text at a reading zoom. The default: the wheel
+    /// can land on any line, and a touchpad that reports itself as
+    /// notches (as it does under Wine) tracks the fingers closely.
+    #[default]
+    Fine,
+    Normal,
+    /// About what a browser does.
+    Fast,
+}
+
+impl WheelStep {
+    pub const ALL: [Self; 3] = [Self::Fine, Self::Normal, Self::Fast];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fine => "Fine",
+            Self::Normal => "Normal",
+            Self::Fast => "Fast",
+        }
+    }
+
+    /// The step, in points.
+    pub fn points(self) -> f32 {
+        match self {
+            Self::Fine => 30.0,
+            Self::Normal => 60.0,
+            Self::Fast => 120.0,
+        }
+    }
+}
+
 /// Easing time constant for a wheel notch: 63% of the way in this long,
-/// visually finished in about three of them.
-const WHEEL_TAU: f32 = 0.075;
+/// visually finished in about three of them. Short, so that the page
+/// has stopped by the time the finger is ready for the next notch.
+const WHEEL_TAU: f32 = 0.05;
 /// The same for touchpad input. Short enough to be imperceptible as
 /// lag, long enough to spread one event's worth across a frame or two
 /// when events and frames fall out of step.
@@ -57,14 +94,9 @@ const VELOCITY_WINDOW: f64 = 0.09;
 const MIN_FLICK: f32 = 300.0;
 /// Ceiling on coasting speed, so stacked flicks cannot run away.
 const MAX_SPEED: f32 = 16000.0;
-/// Notches closer together than this are one spin of the wheel.
-const NOTCH_CHAIN: f64 = 0.11;
-/// Extra distance per notch for each notch already in the spin, and
-/// where that stops growing.
-const NOTCH_ACCEL: f32 = 0.25;
-const NOTCH_ACCEL_MAX: f32 = 4.0;
 
-/// One piece of scroll input. Positive is further down the document.
+/// One piece of scroll input, in points. Positive is further down the
+/// document.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Wheel {
     /// Whole clicks of a detented wheel.
@@ -81,7 +113,9 @@ impl Wheel {
     /// lines -- a touchpad as small fractions of one, a notched wheel as
     /// whole numbers -- so within that unit it is the *wholeness* of the
     /// number that tells the two apart.
-    pub fn from_event(unit: egui::MouseWheelUnit, delta_y: f32) -> Option<Self> {
+    ///
+    /// `line_pt` is how far one line -- one notch -- should travel.
+    pub fn from_event(unit: egui::MouseWheelUnit, delta_y: f32, line_pt: f32) -> Option<Self> {
         if delta_y == 0.0 || !delta_y.is_finite() {
             return None;
         }
@@ -93,13 +127,13 @@ impl Wheel {
             egui::MouseWheelUnit::Line => {
                 let whole = down.abs() >= 0.99 && (down - down.round()).abs() < 0.01;
                 if whole {
-                    Self::Notch(down)
+                    Self::Notch(down * line_pt)
                 } else {
-                    Self::Stream(down * LINE_PT)
+                    Self::Stream(down * line_pt)
                 }
             }
             // Rare, and coarse by definition; several notches' worth.
-            egui::MouseWheelUnit::Page => Self::Notch(down * 6.0),
+            egui::MouseWheelUnit::Page => Self::Notch(down * line_pt * 6.0),
         })
     }
 }
@@ -113,7 +147,11 @@ impl Wheel {
 /// own `show`, and whichever of the two gets there first is the one
 /// that scrolls. Nothing is taken unless the pointer is over `ui`, so
 /// a menu open on top keeps the wheel to itself.
-pub fn take_wheel(ui: &egui::Ui) -> (f64, f32, Vec<Wheel>) {
+///
+/// Only the vertical part is taken. Sideways input is left for the
+/// scroll area, which is where a page zoomed wider than the window gets
+/// its panning from.
+pub fn take_wheel(ui: &egui::Ui, line_pt: f32) -> (f64, f32, Vec<Wheel>) {
     let hovered = ui.rect_contains_pointer(ui.max_rect());
     ui.input_mut(|i| {
         let mut wheel = Vec::new();
@@ -130,11 +168,11 @@ pub fn take_wheel(ui: &egui::Ui) -> (f64, f32, Vec<Wheel>) {
                     if modifiers.ctrl || modifiers.command || modifiers.shift {
                         continue;
                     }
-                    wheel.extend(Wheel::from_event(*unit, delta.y));
+                    wheel.extend(Wheel::from_event(*unit, delta.y, line_pt));
                 }
             }
-            i.smooth_scroll_delta = egui::Vec2::ZERO;
-            i.raw_scroll_delta = egui::Vec2::ZERO;
+            i.smooth_scroll_delta.y = 0.0;
+            i.raw_scroll_delta.y = 0.0;
         }
         // Capped: after a stall, one long frame should not be
         // integrated as if the page had been moving all that time.
@@ -158,9 +196,6 @@ pub struct Scroller {
     samples: VecDeque<(f64, f32)>,
     streaming: bool,
     last_stream: f64,
-    last_notch: f64,
-    notch_run: u32,
-    notch_dir: f32,
 }
 
 impl Scroller {
@@ -190,7 +225,7 @@ impl Scroller {
         let mut streamed = 0.0;
         for event in input {
             match *event {
-                Wheel::Notch(lines) => self.notch(now, lines),
+                Wheel::Notch(points) => self.notch(points),
                 Wheel::Stream(points) => streamed += points,
             }
         }
@@ -223,24 +258,15 @@ impl Scroller {
         moved
     }
 
-    fn notch(&mut self, now: f64, lines: f32) {
-        let dir = lines.signum();
-        if dir == self.notch_dir && now - self.last_notch <= NOTCH_CHAIN {
-            self.notch_run += 1;
-        } else {
-            self.notch_run = 0;
-        }
-        if dir != self.pending.signum() && self.pending != 0.0 {
+    fn notch(&mut self, points: f32) {
+        if points.signum() != self.pending.signum() && self.pending != 0.0 {
             // Reversing: what was still owed the other way is forgotten,
             // or the page would finish going down before coming back up.
             self.pending = 0.0;
         }
-        self.notch_dir = dir;
-        self.last_notch = now;
         self.coast = 0.0;
         self.carry = 0.0;
-        let accel = (1.0 + NOTCH_ACCEL * self.notch_run as f32).min(NOTCH_ACCEL_MAX);
-        self.pending += lines * LINE_PT * accel;
+        self.pending += points;
         self.tau = WHEEL_TAU;
     }
 
@@ -307,6 +333,8 @@ mod tests {
     use super::*;
 
     const DT: f32 = 1.0 / 60.0;
+    /// One notch, at the default step.
+    const STEP: f32 = 30.0;
 
     /// Runs frames with no further input until the scroller settles,
     /// returning the total distance and how many frames it took.
@@ -336,10 +364,19 @@ mod tests {
     #[test]
     fn egui_s_sign_is_turned_into_down_the_document() {
         use egui::MouseWheelUnit::{Line, Point};
-        assert_eq!(Wheel::from_event(Line, -1.0), Some(Wheel::Notch(1.0)));
-        assert_eq!(Wheel::from_event(Line, 2.0), Some(Wheel::Notch(-2.0)));
-        assert_eq!(Wheel::from_event(Point, -7.5), Some(Wheel::Stream(7.5)));
-        assert_eq!(Wheel::from_event(Point, 0.0), None);
+        assert_eq!(
+            Wheel::from_event(Line, -1.0, STEP),
+            Some(Wheel::Notch(STEP))
+        );
+        assert_eq!(
+            Wheel::from_event(Line, 2.0, STEP),
+            Some(Wheel::Notch(-2.0 * STEP))
+        );
+        assert_eq!(
+            Wheel::from_event(Point, -7.5, STEP),
+            Some(Wheel::Stream(7.5))
+        );
+        assert_eq!(Wheel::from_event(Point, 0.0, STEP), None);
     }
 
     /// Windows reports a touchpad in fractions of a line.
@@ -347,76 +384,96 @@ mod tests {
     fn a_fraction_of_a_line_is_fine_grained_input_not_a_notch() {
         use egui::MouseWheelUnit::Line;
         assert_eq!(
-            Wheel::from_event(Line, -0.25),
-            Some(Wheel::Stream(0.25 * LINE_PT))
+            Wheel::from_event(Line, -0.25, STEP),
+            Some(Wheel::Stream(0.25 * STEP))
         );
         assert_eq!(
-            Wheel::from_event(Line, -1.5),
-            Some(Wheel::Stream(1.5 * LINE_PT))
+            Wheel::from_event(Line, -1.5, STEP),
+            Some(Wheel::Stream(1.5 * STEP))
         );
+    }
+
+    #[test]
+    fn the_wheel_step_starts_fine_and_each_is_bigger_than_the_last() {
+        assert_eq!(WheelStep::default(), WheelStep::Fine);
+        assert!(WheelStep::Fine.points() < WheelStep::Normal.points());
+        assert!(WheelStep::Normal.points() < WheelStep::Fast.points());
     }
 
     #[test]
     fn a_notch_travels_its_full_distance_but_not_all_at_once() {
         let mut s = Scroller::default();
         let mut now = 1.0;
-        let first = s.step(now, DT, &[Wheel::Notch(1.0)]);
-        assert!(first > 0.0 && first < LINE_PT * 0.5, "first frame {first}");
+        let first = s.step(now, DT, &[Wheel::Notch(STEP)]);
+        assert!(first > 0.0 && first < STEP * 0.5, "first frame {first}");
         let (rest, frames) = settle(&mut s, &mut now);
-        assert!((first + rest - LINE_PT).abs() < 0.01);
-        // A glide, not a lurch -- and not a crawl either.
-        assert!((6..=30).contains(&frames), "took {frames} frames");
+        assert!((first + rest - STEP).abs() < 0.01);
+        // Eased, not a lurch -- and done before the next notch is due.
+        assert!((4..=20).contains(&frames), "took {frames} frames");
     }
 
     #[test]
     fn a_notch_the_other_way_goes_the_other_way() {
         let mut s = Scroller::default();
         let mut now = 1.0;
-        let first = s.step(now, DT, &[Wheel::Notch(-1.0)]);
+        let first = s.step(now, DT, &[Wheel::Notch(-STEP)]);
         let (rest, _) = settle(&mut s, &mut now);
-        assert!((first + rest + LINE_PT).abs() < 0.01);
+        assert!((first + rest + STEP).abs() < 0.01);
     }
 
+    /// The accuracy guarantee: distance is a count of notches and
+    /// nothing else. Not how fast they came, not how many came before.
     #[test]
-    fn a_spin_of_the_wheel_goes_further_than_the_same_notches_taken_slowly() {
+    fn every_notch_is_the_same_distance_however_fast_they_come() {
         let mut slow = Scroller::default();
         let mut now = 1.0;
         let mut slow_total = 0.0;
         for _ in 0..8 {
-            slow_total += slow.step(now, DT, &[Wheel::Notch(1.0)]);
+            slow_total += slow.step(now, DT, &[Wheel::Notch(STEP)]);
             slow_total += settle(&mut slow, &mut now).0;
             now += 0.3;
         }
-        assert!((slow_total - 8.0 * LINE_PT).abs() < 0.1);
 
         let mut fast = Scroller::default();
         let mut now = 1.0;
         let mut fast_total = 0.0;
         for _ in 0..8 {
-            // A notch every other frame.
-            fast_total += fast.step(now, DT, &[Wheel::Notch(1.0)]);
-            now += DT as f64;
-            fast_total += fast.step(now, DT, &[]);
+            // A notch on every frame, and two on some.
+            fast_total += fast.step(now, DT, &[Wheel::Notch(STEP)]);
             now += DT as f64;
         }
         fast_total += settle(&mut fast, &mut now).0;
-        assert!(
-            fast_total > 1.5 * slow_total,
-            "spin {fast_total} vs slow {slow_total}"
-        );
+
+        assert!((slow_total - 8.0 * STEP).abs() < 0.1, "slow {slow_total}");
+        assert!((fast_total - 8.0 * STEP).abs() < 0.1, "fast {fast_total}");
+    }
+
+    /// A run of notches -- a touchpad under Wine -- ends when the
+    /// notches do. There is no speed to coast on, only a count.
+    #[test]
+    fn notches_never_coast() {
+        let mut s = Scroller::default();
+        let mut now = 1.0;
+        for _ in 0..20 {
+            s.step(now, DT, &[Wheel::Notch(STEP), Wheel::Notch(STEP)]);
+            now += DT as f64;
+        }
+        assert_eq!(s.coast, 0.0);
+        let (_, frames) = settle(&mut s, &mut now);
+        assert!(frames <= 20, "still moving after {frames} frames");
     }
 
     #[test]
     fn reversing_the_wheel_does_not_finish_the_old_direction_first() {
         let mut s = Scroller::default();
         let mut now = 1.0;
-        let mut total = s.step(now, DT, &[Wheel::Notch(3.0)]);
+        let mut total = s.step(now, DT, &[Wheel::Notch(3.0 * STEP)]);
         now += DT as f64;
-        let after_reverse = s.step(now, DT, &[Wheel::Notch(-1.0)]);
+        let after_reverse = s.step(now, DT, &[Wheel::Notch(-STEP)]);
         assert!(after_reverse < 0.0, "still going down: {after_reverse}");
         total += after_reverse + settle(&mut s, &mut now).0;
         // Whatever of the first move got through, minus one notch back.
-        assert!(total < 3.0 * LINE_PT - LINE_PT);
+        assert!(total < 3.0 * STEP - STEP);
     }
 
     #[test]

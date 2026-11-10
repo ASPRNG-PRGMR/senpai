@@ -48,9 +48,11 @@ mod recent;
 mod scroll;
 mod theme;
 
+use continuous::Fit;
 use eframe::egui;
 use keybinds::{NavKeys, NavTarget, Preset};
 use lru::LruCache;
+use scroll::WheelStep;
 use senpai_core::engine::{PdfEngine, PdfEngineOpen};
 use senpai_core::file_loader::LoadedFile;
 use senpai_core::model::{PageHandle, PageSize, RenderedPage};
@@ -220,6 +222,18 @@ const PAGE_FLASH: f64 = 1.4;
 /// larger while leaving text exactly where it was, since text is sized
 /// relative to this and both halves moved together.
 const DEFAULT_SCALE: f64 = 1.8;
+/// The limits of a hand-set zoom. The upper one is about memory: a
+/// letter page at 6.0 is a 70MB texture.
+const MIN_SCALE: f64 = 0.2;
+const MAX_SCALE: f64 = 6.0;
+/// A fit may go below the hand-set minimum: a poster-sized page in a
+/// small window has to be allowed to fit.
+const MIN_FIT_SCALE: f64 = 0.05;
+/// What one press of `+` or `-` multiplies the zoom by.
+const ZOOM_STEP: f64 = 1.2;
+/// How long the zoom level has to hold still before pages are rendered
+/// at it. Shorter than a pause anyone makes on purpose mid-pinch.
+const ZOOM_SETTLE: f64 = 0.15;
 const RECENT_IN_MENU: usize = 6;
 /// Budget for an entry's label, in characters. The dropdown's pills do
 /// not wrap or truncate on their own -- a long name would simply push
@@ -336,21 +350,9 @@ fn elide(text: &str, max: usize) -> String {
     out
 }
 
-enum RenderKind {
-    Primary { generation: u64 },
-    Prefetch,
-}
-
-struct PendingRequest {
-    page: usize,
-    scale: f64,
-    generation: u64,
-}
-
 struct RenderResult {
     page: usize,
     scale: f64,
-    kind: RenderKind,
     outcome: Result<Arc<RenderedPage>, String>,
 }
 
@@ -358,15 +360,10 @@ struct RenderResult {
 /// there work" and a push of new work always happen atomically, and
 /// the worker can do a true zero-CPU blocking wait with no polling.
 struct WorkerState {
-    primary: Option<PendingRequest>,
-    prefetch: VecDeque<(usize, f64)>,
-    /// Whether every finished prefetch should repaint, rather than only
-    /// the one that empties the queue. Paged mode leaves it off: a
-    /// prefetched neighbour changes nothing on screen. Continuous mode
-    /// turns it on, because there the queue *is* what is on screen, and
-    /// three visible pages should each appear as they finish rather than
-    /// all at once behind the slowest.
-    eager_repaint: bool,
+    /// What to render, in order. Owned by the UI thread in the sense
+    /// that it *replaces* this every time what is on screen changes;
+    /// the worker only ever takes from the front.
+    queue: VecDeque<(usize, f64)>,
     /// Set when this worker's document has been replaced (Files -> Open).
     /// The worker returns at the top of its next loop iteration, dropping
     /// its render cache and its `Arc<PopplerEngine>` as it unwinds -- so
@@ -376,22 +373,6 @@ struct WorkerState {
 }
 
 type Shared = Arc<(Mutex<WorkerState>, Condvar)>;
-
-enum WorkItem {
-    Primary(PendingRequest),
-    Prefetch(usize, f64),
-}
-
-fn push_prefetch_dedup(state: &mut WorkerState, page: usize, scale: f64) {
-    let scale_bits = scale.to_bits();
-    let already_queued = state
-        .prefetch
-        .iter()
-        .any(|&(p, s)| p == page && s.to_bits() == scale_bits);
-    if !already_queued {
-        state.prefetch.push_back((page, scale));
-    }
-}
 
 fn spawn_render_worker(
     engine: Arc<PopplerEngine>,
@@ -404,69 +385,31 @@ fn spawn_render_worker(
             LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap());
 
         loop {
-            let work = {
+            let (page, scale) = {
                 let (lock, cvar) = &*shared;
                 let mut guard = lock.lock().unwrap();
                 loop {
                     if guard.shutdown {
                         return;
                     }
-                    if let Some(req) = guard.primary.take() {
-                        break WorkItem::Primary(req);
-                    }
-                    if let Some((page, scale)) = guard.prefetch.pop_front() {
-                        break WorkItem::Prefetch(page, scale);
+                    if let Some(next) = guard.queue.pop_front() {
+                        break next;
                     }
                     guard = cvar.wait(guard).unwrap();
                 }
             };
 
-            match work {
-                WorkItem::Primary(request) => {
-                    let key = (request.page, request.scale.to_bits());
-                    let outcome =
-                        render_or_cache_hit(&engine, &mut cache, key, request.page, request.scale);
-
-                    let _ = result_tx.send(RenderResult {
-                        page: request.page,
-                        scale: request.scale,
-                        kind: RenderKind::Primary {
-                            generation: request.generation,
-                        },
-                        outcome,
-                    });
-                    ctx.request_repaint();
-
-                    // NOTE: deliberately no worker-side neighbor
-                    // prefetch here anymore. Paged mode's +/-1 lookahead
-                    // is now driven entirely by the UI thread, computed
-                    // fresh from the actual current page every frame
-                    // (see SenpaiApp's ViewMode::Paged arm in update()).
-                    // The old version queued neighbors of "whatever page
-                    // the worker just finished," which could lag behind
-                    // the user's real position under fast navigation.
-                }
-                WorkItem::Prefetch(page, scale) => {
-                    let key = (page, scale.to_bits());
-                    let outcome = render_or_cache_hit(&engine, &mut cache, key, page, scale);
-
-                    let wants_repaint = {
-                        let (lock, _cvar) = &*shared;
-                        let guard = lock.lock().unwrap();
-                        guard.prefetch.is_empty() || guard.eager_repaint
-                    };
-
-                    let _ = result_tx.send(RenderResult {
-                        page,
-                        scale,
-                        kind: RenderKind::Prefetch,
-                        outcome,
-                    });
-                    if wants_repaint {
-                        ctx.request_repaint();
-                    }
-                }
-            }
+            let key = (page, scale.to_bits());
+            let outcome = render_or_cache_hit(&engine, &mut cache, key, page, scale);
+            let _ = result_tx.send(RenderResult {
+                page,
+                scale,
+                outcome,
+            });
+            // After every page, not only the last: the queue is what is
+            // on screen, and three visible pages should each appear as
+            // they finish rather than all at once behind the slowest.
+            ctx.request_repaint();
         }
     });
 }
@@ -508,8 +451,6 @@ struct SenpaiApp {
     /// channel back from it) belongs to one specific document.
     shared: Option<Shared>,
     result_rx: Option<Receiver<RenderResult>>,
-    next_generation: u64,
-    requested_primary: Option<(usize, u64, u64)>,
 
     textures: LruCache<(usize, u64), egui::TextureHandle>,
     pending_evictions: Vec<egui::TextureHandle>,
@@ -519,8 +460,37 @@ struct SenpaiApp {
     /// worker would be handed the same doomed page on every frame for
     /// as long as it was on screen.
     failed: HashSet<(usize, u64)>,
+    /// Whether a page on screen is still waiting for its render.
     render_pending: bool,
-    continuous_render_pending: bool,
+
+    /// How the page is fitted to the window, or `None` for a zoom level
+    /// the reader set by hand (`scale`). PDFs only: text has nothing to
+    /// fit.
+    fit: Option<Fit>,
+    /// The zoom level PDF pages were actually drawn at last frame --
+    /// `scale`, or whatever the fit came to in this window. It is what
+    /// the bar reports, and where a manual zoom starts from.
+    shown_scale: f64,
+    /// The size a whole document is fitted by in Continuous mode.
+    doc_bound: PageSize,
+    /// The paged view: the same scrolling view as Continuous, over the
+    /// one page being shown.
+    paged: continuous::View,
+    /// Which page `paged` last showed, so a page turn can be noticed
+    /// and the new page started from its top.
+    paged_page: usize,
+    /// Whether the page in the paged view is taller than the window,
+    /// which decides what Up and Down mean there.
+    paged_overflows: bool,
+    /// Where on screen a pinch is centred, for the frame it happens in.
+    zoom_focus: Option<egui::Pos2>,
+    /// Until when to hold off rendering at a new zoom level. A pinch or
+    /// a window drag passes through dozens of levels on its way to the
+    /// one that matters; each would be a full render of every page on
+    /// screen, thrown away a frame later.
+    settle_until: f64,
+    last_avail: egui::Vec2,
+    wheel_step: WheelStep,
 
     dark_mode: bool,
     auto_hide_enabled: bool,
@@ -596,6 +566,74 @@ fn paint_page(painter: &egui::Painter, texture: egui::TextureId, rect: egui::Rec
     );
 }
 
+/// Draws one PDF page into `rect` from whatever is cached for it, and
+/// says whether it is still waiting for a render at this zoom level.
+fn paint_pdf_page(
+    painter: &egui::Painter,
+    textures: &mut LruCache<(usize, u64), egui::TextureHandle>,
+    failed: &HashSet<(usize, u64)>,
+    page: usize,
+    rect: egui::Rect,
+    scale: f64,
+    dark: bool,
+) -> bool {
+    let key = (page, scale.to_bits());
+    // Whole pixels, or a page that lands on a fractional offset is
+    // resampled and its text goes soft.
+    let rect = egui::Rect::from_min_size(painter.round_pos_to_pixels(rect.min), rect.size());
+    if let Some(tex) = textures.get(&key) {
+        // At its own size: the layout works in points and the render in
+        // whole pixels, and stretching one onto the other by a fraction
+        // of a pixel blurs for nothing.
+        paint_page(
+            painter,
+            tex.id(),
+            egui::Rect::from_min_size(rect.min, tex.size_vec2()),
+        );
+        return false;
+    }
+    let failed = failed.contains(&key);
+    // The same page at another zoom, if there is one, stretched into
+    // place. Mid-pinch that is every page on screen: soft while the
+    // fingers are moving, sharp once they stop, and never blank.
+    let stand_in = textures
+        .iter()
+        .filter(|((p, _), _)| *p == page)
+        .map(|((_, bits), _)| *bits)
+        .min_by(|a, b| {
+            let off = |bits: &u64| (f64::from_bits(*bits) / scale).ln().abs();
+            off(a).total_cmp(&off(b))
+        });
+    if let Some(tex) = stand_in.and_then(|bits| textures.get(&(page, bits))) {
+        paint_page(painter, tex.id(), rect);
+        // A page that cannot be rendered is not one being waited for.
+        return !failed;
+    }
+    // Nothing yet: a card the exact size and place the page will be,
+    // so its arrival fills a space rather than moving one.
+    painter.rect_filled(
+        rect,
+        egui::Rounding::same(2.0),
+        if dark {
+            egui::Color32::from_gray(44)
+        } else {
+            egui::Color32::from_gray(222)
+        },
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if failed {
+            format!("Page {} could not be rendered", page + 1)
+        } else {
+            format!("{}", page + 1)
+        },
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_gray(if dark { 110 } else { 150 }),
+    );
+    !failed
+}
+
 /// Whether a pointer press should close the open menu.
 ///
 /// Presses on the bar are excluded so the menu button keeps its own
@@ -657,16 +695,23 @@ impl SenpaiApp {
             current_page: 0,
             scale: DEFAULT_SCALE,
             page_sizes: Vec::new(),
-            continuous: continuous::View::default(),
+            continuous: continuous::View::new("continuous_pages"),
             shared: None,
             result_rx: None,
-            next_generation: 0,
-            requested_primary: None,
             textures: LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()),
             pending_evictions: Vec::new(),
             failed: HashSet::new(),
             render_pending: false,
-            continuous_render_pending: false,
+            fit: Some(Fit::Page),
+            shown_scale: DEFAULT_SCALE,
+            doc_bound: continuous::FALLBACK_PAGE_SIZE,
+            paged: continuous::View::new("paged_page"),
+            paged_page: usize::MAX,
+            paged_overflows: false,
+            zoom_focus: None,
+            settle_until: 0.0,
+            last_avail: egui::Vec2::ZERO,
+            wheel_step: WheelStep::default(),
             dark_mode: true,
             auto_hide_enabled: true,
             view_mode: ViewMode::Paged,
@@ -887,9 +932,7 @@ impl SenpaiApp {
 
         let shared: Shared = Arc::new((
             Mutex::new(WorkerState {
-                primary: None,
-                prefetch: VecDeque::new(),
-                eager_repaint: false,
+                queue: VecDeque::new(),
                 shutdown: false,
             }),
             Condvar::new(),
@@ -906,14 +949,14 @@ impl SenpaiApp {
         // A fresh view rather than a reset offset: the scroll area's own
         // state is keyed by id and would otherwise open the new document
         // wherever the old one was left.
-        self.continuous = continuous::View::default();
+        self.continuous = continuous::View::new("continuous_pages");
+        self.paged = continuous::View::new("paged_page");
+        self.paged_page = usize::MAX;
+        self.doc_bound = continuous::bounding_size(&self.page_sizes);
         // Flashes the count once on open, so how long the document is
         // can be seen without having to turn a page to find out.
         self.last_shown_page = usize::MAX;
-        self.next_generation = 0;
-        self.requested_primary = None;
         self.render_pending = false;
-        self.continuous_render_pending = false;
 
         self.set_window_title(ctx, path);
     }
@@ -928,8 +971,7 @@ impl SenpaiApp {
             let (lock, cvar) = &*old;
             let mut guard = lock.lock().unwrap();
             guard.shutdown = true;
-            guard.primary = None;
-            guard.prefetch.clear();
+            guard.queue.clear();
             cvar.notify_all();
         }
         // Dropping the receiver makes any result the old worker still
@@ -969,94 +1011,41 @@ impl SenpaiApp {
         self.textures.put(key, handle);
     }
 
-    fn request_primary(&mut self, page: usize) {
-        let Some(shared) = self.shared.clone() else {
-            return;
-        };
-        let want = (page, self.scale.to_bits());
-        let already_current = self.textures.contains(&want) || self.failed.contains(&want);
-        let already_requested = self
-            .requested_primary
-            .map(|(p, s, _)| (p, s) == want)
-            .unwrap_or(false);
-        if already_current || already_requested {
-            return;
-        }
-
-        self.next_generation += 1;
-        let generation = self.next_generation;
-        {
-            let (lock, cvar) = &*shared;
-            let mut guard = lock.lock().unwrap();
-            guard.primary = Some(PendingRequest {
-                page: want.0,
-                scale: self.scale,
-                generation,
-            });
-            cvar.notify_one();
-        }
-        self.requested_primary = Some((want.0, want.1, generation));
-        self.render_pending = true;
-        self.render_started = None;
-    }
-
-    /// Paged mode's +/-1 lookahead: called with current_page-1 and
-    /// current_page+1, recomputed every frame.
-    fn request_window_page(&mut self, page: usize) {
-        let Some(shared) = self.shared.clone() else {
-            return;
-        };
-        if page >= self.page_count {
-            return;
-        }
-        let key = (page, self.scale.to_bits());
-        if self.textures.contains(&key) || self.failed.contains(&key) {
-            return;
-        }
-        let (lock, cvar) = &*shared;
-        let mut guard = lock.lock().unwrap();
-        guard.eager_repaint = false;
-        push_prefetch_dedup(&mut guard, page, self.scale);
-        cvar.notify_one();
-    }
-
-    /// Continuous mode's render queue: exactly `pages`, in that order,
-    /// replacing whatever was queued before.
+    /// The render queue: exactly `pages`, in that order, replacing
+    /// whatever was queued before.
     ///
-    /// Replaced, not appended to, and that is the difference from
-    /// `request_window_page`. Dragging the scrollbar through a long
+    /// Replaced, not appended to. Dragging the scrollbar through a long
     /// document passes hundreds of pages in a second; a queue that only
     /// grew would have the worker faithfully render every one of them
     /// before reaching the page the reader stopped on. This way the
     /// most a fast scroll can waste is the one render already running.
-    fn set_render_window(&mut self, pages: &[usize]) {
+    fn set_render_window(&mut self, pages: &[(usize, f64)]) {
         let Some(shared) = &self.shared else {
             return;
         };
-        let scale = self.scale;
-        let scale_bits = scale.to_bits();
         let wanted: VecDeque<(usize, f64)> = pages
             .iter()
-            .filter(|&&page| {
-                let key = (page, scale_bits);
-                !self.textures.contains(&key) && !self.failed.contains(&key)
+            .filter(|&&(page, scale)| {
+                let key = (page, scale.to_bits());
+                page < self.page_count
+                    && !self.textures.contains(&key)
+                    && !self.failed.contains(&key)
             })
-            .map(|&page| (page, scale))
+            .copied()
             .collect();
         let (lock, cvar) = &**shared;
         let mut guard = lock.lock().unwrap();
-        guard.eager_repaint = true;
         // Compared first so an unchanged window -- every frame the
         // reader is not scrolling -- neither reallocates nor wakes the
         // worker.
-        let unchanged = guard.prefetch.len() == wanted.len()
+        let unchanged = guard.queue.len() == wanted.len()
             && guard
-                .prefetch
+                .queue
                 .iter()
                 .zip(&wanted)
                 .all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits());
         if !unchanged {
-            guard.prefetch = wanted;
+            guard.queue = wanted;
             cvar.notify_one();
         }
     }
@@ -1066,13 +1055,6 @@ impl SenpaiApp {
     fn close_menu(&mut self) {
         self.open_menu = None;
         self.rebinding = None;
-    }
-
-    fn clear_pending_prefetch(&mut self) {
-        if let Some(shared) = &self.shared {
-            let (lock, _cvar) = &**shared;
-            lock.lock().unwrap().prefetch.clear();
-        }
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
@@ -1087,21 +1069,6 @@ impl SenpaiApp {
 
         for result in results {
             let key = (result.page, result.scale.to_bits());
-
-            if let RenderKind::Primary { generation } = result.kind {
-                let is_latest = self
-                    .requested_primary
-                    .map(|(_, _, g)| g == generation)
-                    .unwrap_or(false);
-                if is_latest {
-                    self.render_pending = false;
-                }
-                // No `continue` here: even a superseded render is real,
-                // correct work. Caching it costs nothing extra (display
-                // is separately gated by whether it matches the CURRENT
-                // page/scale) and means navigating back to a recently-
-                // left page doesn't force a re-render.
-            }
 
             match result.outcome {
                 Ok(rendered) => {
@@ -1150,13 +1117,17 @@ impl SenpaiApp {
             self.continuous.go_to_page(self.current_page);
         }
     }
-    fn zoom_in(&mut self) {
-        self.scale = (self.scale * 1.2).min(6.0);
-        self.clear_pending_prefetch();
-    }
-    fn zoom_out(&mut self) {
-        self.scale = (self.scale / 1.2).max(0.2);
-        self.clear_pending_prefetch();
+    /// Multiplies the zoom level, leaving any fit behind.
+    ///
+    /// A fit is given up from where it actually was: pressing `+` on a
+    /// fitted page makes that page a fifth larger, rather than jumping
+    /// to a fifth more than some unrelated number left over from before
+    /// the fit was chosen.
+    fn zoom_by(&mut self, factor: f64) {
+        if self.text.is_none() && self.fit.take().is_some() {
+            self.scale = self.shown_scale;
+        }
+        self.scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
     }
 
     /// Back to the level a document opens at -- the 100% the bar reports.
@@ -1165,14 +1136,23 @@ impl SenpaiApp {
     /// landing on 104% or 96% and not being able to tell which. A reset
     /// is the only way to actually return to where you started.
     fn reset_zoom(&mut self) {
+        if self.text.is_none() {
+            self.fit = None;
+        }
         self.scale = DEFAULT_SCALE;
-        self.clear_pending_prefetch();
+    }
+
+    /// Fits pages to the window. A PDF matter only: text already wraps
+    /// to whatever width it is given.
+    fn set_fit(&mut self, fit: Fit) {
+        if self.text.is_none() {
+            self.fit = Some(fit);
+        }
     }
 
     fn set_view_mode(&mut self, mode: ViewMode) {
         if self.view_mode != mode {
             self.view_mode = mode;
-            self.clear_pending_prefetch();
             if mode == ViewMode::Continuous {
                 // Arrive on the page that was being read. The other
                 // direction needs nothing: the continuous view keeps
@@ -1271,6 +1251,25 @@ impl eframe::App for SenpaiApp {
                     i.modifiers.command && i.key_pressed(egui::Key::Num0),
                 )
             });
+            // F and W, as in Evince. Bare keys only -- Alt+F is the
+            // Files menu -- and only while the reader has not made the
+            // key a direction: the Gamer preset has W as Up, and a
+            // binding someone set on purpose outranks a default.
+            let (want_fit_page, want_fit_width) = ctx.input(|i| {
+                let bare = !i.modifiers.alt && !i.modifiers.command;
+                let free =
+                    |key: egui::Key| NavTarget::ALL.iter().all(|t| keys.get(*t) != Some(key));
+                (
+                    bare && free(egui::Key::F) && i.key_pressed(egui::Key::F),
+                    bare && free(egui::Key::W) && i.key_pressed(egui::Key::W),
+                )
+            });
+            if want_fit_page {
+                self.set_fit(Fit::Page);
+            }
+            if want_fit_width {
+                self.set_fit(Fit::Width);
+            }
             let [want_left, want_right, want_up, want_down] = nav;
             if self.text.is_some() {
                 // Left and right keep meaning "move on by one
@@ -1293,15 +1292,23 @@ impl eframe::App for SenpaiApp {
                     self.md_scroll -= screen * 0.2;
                 }
             } else if self.view_mode == ViewMode::Paged {
-                // A page is fitted to the window, so there is nothing
-                // for up and down to scroll. Rather than have them do
-                // nothing, they turn pages too -- which is what every
-                // other reader does once a page fits.
-                if want_right || want_down {
+                // Up and down scroll the page when there is more of it
+                // than the window shows -- fitted to width, or zoomed
+                // in. When the whole page is on screen there is nothing
+                // to scroll, and rather than do nothing they turn pages
+                // too, which is what every other reader does.
+                let scrolls = self.paged_overflows;
+                if want_right || (want_down && !scrolls) {
                     self.next_page();
                 }
-                if want_left || want_up {
+                if want_left || (want_up && !scrolls) {
                     self.prev_page();
+                }
+                if scrolls && want_down {
+                    self.paged.scroll_by_screens(0.2);
+                }
+                if scrolls && want_up {
+                    self.paged.scroll_by_screens(-0.2);
                 }
             } else {
                 // Here the two pairs finally mean different things, as
@@ -1321,10 +1328,10 @@ impl eframe::App for SenpaiApp {
                 }
             }
             if want_zoom_in {
-                self.zoom_in();
+                self.zoom_by(ZOOM_STEP);
             }
             if want_zoom_out {
-                self.zoom_out();
+                self.zoom_by(1.0 / ZOOM_STEP);
             }
             if want_zoom_reset {
                 self.reset_zoom();
@@ -1358,6 +1365,21 @@ impl eframe::App for SenpaiApp {
             if escape {
                 self.close_menu();
             }
+        }
+
+        // A pinch, or Ctrl and the wheel -- egui reports both as one
+        // number. Outside the key block above on purpose: that block is
+        // skipped while the page box has the keyboard, and a pinch has
+        // nothing to do with the keyboard.
+        let (pinch, pointer, now) =
+            ctx.input(|i| (i.zoom_delta() as f64, i.pointer.hover_pos(), i.time));
+        let on_chrome =
+            pointer.is_some_and(|p| self.bar_rect.contains(p) || self.menu_rect.contains(p));
+        if pinch != 1.0 && pinch.is_finite() && pinch > 0.0 && self.has_document() && !on_chrome {
+            self.zoom_by(pinch);
+            // Zoom about the fingers, not about the top of the window.
+            self.zoom_focus = pointer;
+            self.settle_until = now + ZOOM_SETTLE;
         }
 
         let hovering_top = ctx.input(|i| {
@@ -1403,24 +1425,7 @@ impl eframe::App for SenpaiApp {
             return;
         }
 
-        match self.view_mode {
-            ViewMode::Paged => {
-                self.request_primary(self.current_page);
-                // Dynamic 1-page lookahead/lookbehind, recomputed fresh
-                // from the ACTUAL current page every single frame --
-                // never anchored to a stale position.
-                if self.current_page + 1 < self.page_count {
-                    self.request_window_page(self.current_page + 1);
-                }
-                if self.current_page > 0 {
-                    self.request_window_page(self.current_page - 1);
-                }
-                self.show_paged_view(ctx, bg);
-            }
-            ViewMode::Continuous => {
-                self.show_continuous_view(ctx, bg);
-            }
-        }
+        self.show_pdf_view(ctx, bg);
 
         self.show_status_pills(ctx);
         self.show_top_bar(ctx, bar_t);
@@ -1440,10 +1445,7 @@ impl SenpaiApp {
     fn show_status_pills(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
 
-        let pending = match self.view_mode {
-            ViewMode::Paged => self.render_pending,
-            ViewMode::Continuous => self.continuous_render_pending,
-        };
+        let pending = self.render_pending;
         if pending {
             if self.render_started.is_none() {
                 self.render_started = Some(now);
@@ -1622,7 +1624,7 @@ impl SenpaiApp {
 
                 // Scrolled by the same model as the PDF view, taking
                 // the wheel before the scroll area can.
-                let (now, dt, wheel) = scroll::take_wheel(ui);
+                let (now, dt, wheel) = scroll::take_wheel(ui, self.wheel_step.points());
                 if scroll != 0.0 {
                     self.text_scroller.nudge(scroll);
                 }
@@ -1675,123 +1677,112 @@ impl SenpaiApp {
             });
     }
 
-    fn show_paged_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
-        let key = (self.current_page, self.scale.to_bits());
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(bg))
-            .show(ctx, |ui| {
-                if let Some(tex) = self.textures.get(&key) {
-                    let avail = ui.available_size();
-                    let tex_size = tex.size_vec2();
-                    let fit_scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                    let draw_size = tex_size * fit_scale.clamp(0.01, 1.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.image((tex.id(), draw_size));
-                    });
-                }
-            });
-    }
-
-    /// Continuous scroll: the whole document as one column.
+    /// A PDF, in either mode.
     ///
-    /// The geometry and the scrolling are `continuous::View`'s. What is
-    /// left for this function is the part that needs the app: which
-    /// texture to draw into each rectangle it is handed, and turning the
-    /// range it reports as visible into the worker's render queue.
-    fn show_continuous_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
+    /// The geometry and the scrolling are `continuous::View`'s, and both
+    /// modes use it: Continuous over every page, Paged over the one
+    /// being shown. What is left for this function is the part that
+    /// needs the app -- what zoom level a fit comes to in this window,
+    /// which texture goes in each rectangle it is handed, and turning
+    /// what it reports as visible into the worker's render queue.
+    fn show_pdf_view(&mut self, ctx: &egui::Context, bg: egui::Color32) {
         let dark = self.dark_mode;
-        let scale = self.scale;
-        let scale_bits = scale.to_bits();
-        let mut any_missing = false;
-        let shown = egui::CentralPanel::default()
+        let paged = self.view_mode == ViewMode::Paged;
+        let current = self.current_page.min(self.page_count.saturating_sub(1));
+        let focus = self.zoom_focus.take();
+        let line_pt = self.wheel_step.points();
+        let fit = self.fit;
+        let custom = self.scale;
+        // What a fit comes to for a page of `size`, in a window of
+        // `avail`; or the hand-set level when there is no fit.
+        let scale_for = move |size: PageSize, avail: egui::Vec2| match fit {
+            Some(fit) => continuous::fit_scale(fit, size, avail).clamp(MIN_FIT_SCALE, MAX_SCALE),
+            None => custom,
+        };
+
+        if paged && self.paged_page != current {
+            // A different page: start it from its top, whatever part of
+            // the last one was being looked at.
+            self.paged.go_to_page(0);
+            self.paged_page = current;
+        }
+
+        let mut missing = false;
+        let (shown, scale, avail) = egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg))
             .show(ctx, |ui| {
+                let avail = ui.available_size();
+                // In Paged mode each page is fitted on its own, so a
+                // landscape slide among portrait pages fills the window
+                // as well as they do. In Continuous one level has to
+                // serve the whole column, so it is the level at which
+                // the largest page fits.
+                let (first, pages, fit_to) = if paged {
+                    (
+                        current,
+                        &self.page_sizes[current..current + 1],
+                        self.page_sizes[current],
+                    )
+                } else {
+                    (0, &self.page_sizes[..], self.doc_bound)
+                };
+                let scale = scale_for(fit_to, avail);
+                let view = if paged {
+                    &mut self.paged
+                } else {
+                    &mut self.continuous
+                };
                 let textures = &mut self.textures;
-                self.continuous.show(
-                    ui,
-                    &self.page_sizes,
-                    scale,
-                    |painter, page, rect, shrunk| {
-                        // Whole pixels, or a page that lands on a
-                        // fractional offset is resampled and its text
-                        // goes soft.
-                        let rect = egui::Rect::from_min_size(
-                            painter.round_pos_to_pixels(rect.min),
-                            rect.size(),
-                        );
-                        if let Some(tex) = textures.get(&(page, scale_bits)) {
-                            // At its own size unless the page was shrunk
-                            // to fit: the layout works in points and the
-                            // render in whole pixels, and stretching one
-                            // onto the other by a fraction of a pixel
-                            // blurs for nothing.
-                            let size = if shrunk { rect.size() } else { tex.size_vec2() };
-                            paint_page(
-                                painter,
-                                tex.id(),
-                                egui::Rect::from_min_size(rect.min, size),
-                            );
-                            return;
-                        }
-                        let failed = self.failed.contains(&(page, scale_bits));
-                        // A page that cannot be rendered is not one
-                        // still being waited for.
-                        any_missing |= !failed;
-                        // The same page at another zoom, if there is
-                        // one, stretched into place. Right after a zoom
-                        // that is every page on screen: soft for a
-                        // moment, then sharp, instead of blank and then
-                        // sharp.
-                        let stand_in = textures
-                            .iter()
-                            .filter(|((p, _), _)| *p == page)
-                            .map(|((_, bits), _)| *bits)
-                            .min_by(|a, b| {
-                                let off = |bits: &u64| (f64::from_bits(*bits) / scale).ln().abs();
-                                off(a).total_cmp(&off(b))
-                            });
-                        if let Some(tex) = stand_in.and_then(|bits| textures.get(&(page, bits))) {
-                            paint_page(painter, tex.id(), rect);
-                            return;
-                        }
-                        // Nothing yet: a card the exact size and place
-                        // the page will be, so its arrival fills a
-                        // space rather than moving one.
-                        painter.rect_filled(
-                            rect,
-                            egui::Rounding::same(2.0),
-                            if dark {
-                                egui::Color32::from_gray(44)
-                            } else {
-                                egui::Color32::from_gray(222)
-                            },
-                        );
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            if failed {
-                                format!("Page {} could not be rendered", page + 1)
-                            } else {
-                                format!("{}", page + 1)
-                            },
-                            egui::FontId::proportional(13.0),
-                            egui::Color32::from_gray(if dark { 110 } else { 150 }),
-                        );
-                    },
-                )
+                let failed = &self.failed;
+                let shown = view.show(ui, pages, scale, focus, line_pt, |painter, index, rect| {
+                    missing |=
+                        paint_pdf_page(painter, textures, failed, first + index, rect, scale, dark);
+                });
+                (shown, scale, avail)
             })
             .inner;
 
-        self.current_page = shown.current_page;
-        let mut order = continuous::render_order(
-            shown.visible,
-            self.page_count,
-            CONTINUOUS_BUFFER_PAGES,
-            shown.forward,
-        );
-        order.truncate(CONTINUOUS_MAX_WINDOW);
-        self.set_render_window(&order);
-        self.continuous_render_pending = any_missing;
+        let now = ctx.input(|i| i.time);
+        if self.fit.is_some() && avail != self.last_avail && self.last_avail != egui::Vec2::ZERO {
+            // The window is being dragged and the fit is following it.
+            self.settle_until = now + ZOOM_SETTLE;
+        }
+        self.last_avail = avail;
+        self.shown_scale = scale;
+
+        let wanted: Vec<(usize, f64)> = if paged {
+            self.paged_overflows = shown.overflows;
+            // The page itself, then the one a turn forward would show,
+            // then the one behind. Each at the level *it* would be
+            // drawn at, which under a fit depends on its own size.
+            let mut wanted = vec![(current, scale)];
+            for neighbour in [current + 1, current.wrapping_sub(1)] {
+                if let Some(size) = self.page_sizes.get(neighbour) {
+                    wanted.push((neighbour, scale_for(*size, avail)));
+                }
+            }
+            wanted
+        } else {
+            self.current_page = shown.current_page;
+            let mut order = continuous::render_order(
+                shown.visible,
+                self.page_count,
+                CONTINUOUS_BUFFER_PAGES,
+                shown.forward,
+            );
+            order.truncate(CONTINUOUS_MAX_WINDOW);
+            order.into_iter().map(|page| (page, scale)).collect()
+        };
+
+        if now < self.settle_until {
+            // Still changing. Draw from what is cached, stretched, and
+            // ask for nothing until the level holds still.
+            self.set_render_window(&[]);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(self.settle_until - now));
+        } else {
+            self.set_render_window(&wanted);
+        }
+        self.render_pending = missing;
     }
 
     /// The top bar. `fade` is 0..1 from the caller's animation, so the bar
@@ -1855,7 +1846,11 @@ impl SenpaiApp {
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "{}%",
-                                                zoom_percent(self.scale)
+                                                zoom_percent(if self.text.is_some() {
+                                                    self.scale
+                                                } else {
+                                                    self.shown_scale
+                                                })
                                             ))
                                             .color(theme::text_faint())
                                             .size(theme::COUNTER_FONT - 1.0),
@@ -2163,8 +2158,35 @@ impl SenpaiApp {
                 egui::RichText::new(if self.view_mode == ViewMode::Continuous {
                     "Left and right jump a page; up and down scroll."
                 } else {
-                    "One page at a time, fitted to the window."
+                    "One page at a time."
                 })
+                .color(theme::text_faint())
+                .size(10.5),
+            );
+
+            theme::divider(ui);
+            theme::section_label(ui, "Zoom");
+            let current = match self.fit {
+                Some(Fit::Page) => 0,
+                Some(Fit::Width) => 1,
+                None => 2,
+            };
+            let free = format!("{}%", zoom_percent(self.shown_scale));
+            if let Some(i) =
+                theme::segmented(ui, "fit_seg", &["Fit page", "Fit width", &free], current)
+            {
+                match i {
+                    0 => self.set_fit(Fit::Page),
+                    1 => self.set_fit(Fit::Width),
+                    // Keeps the size it is, and stops following the
+                    // window.
+                    _ => self.zoom_by(1.0),
+                }
+            }
+            ui.label(
+                egui::RichText::new(
+                    "F fits the page, W fits the width. Pinch, or + and −, to zoom.",
+                )
                 .color(theme::text_faint())
                 .size(10.5),
             );
@@ -2216,6 +2238,24 @@ impl SenpaiApp {
             egui::RichText::new("Reveal by hovering the top edge, or Alt+F / T / M / O.")
                 .color(theme::text_faint())
                 .size(10.5),
+        );
+
+        theme::divider(ui);
+        theme::section_label(ui, "Wheel step");
+        let labels = WheelStep::ALL.map(WheelStep::label);
+        let current = WheelStep::ALL
+            .iter()
+            .position(|s| *s == self.wheel_step)
+            .unwrap_or(0);
+        if let Some(i) = theme::segmented(ui, "wheel_seg", &labels, current) {
+            self.wheel_step = WheelStep::ALL[i];
+        }
+        ui.label(
+            egui::RichText::new(
+                "How far one notch of the wheel scrolls. Always the same distance.",
+            )
+            .color(theme::text_faint())
+            .size(10.5),
         );
 
         theme::divider(ui);
