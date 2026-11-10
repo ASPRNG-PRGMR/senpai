@@ -133,7 +133,41 @@ pub struct NavKeys {
 
 impl NavKeys {
     pub fn load() -> Self {
-        config::read(STORE).map(|t| parse(&t)).unwrap_or_default()
+        let saved = config::read(STORE).map(|t| parse(&t)).unwrap_or_default();
+        let keys = saved.upgraded();
+        if keys != saved {
+            // Written back at once, so the file says what the reader is
+            // actually doing rather than what it did two versions ago.
+            keys.save();
+        }
+        keys
+    }
+
+    /// Carries a saved set forward when a preset it came from has been
+    /// corrected since.
+    ///
+    /// The Vim preset used to be j l i k. Correcting the preset alone
+    /// changed nothing for anyone who had already chosen it: their
+    /// file held the four keys, not the word "Vim", so `j` went on
+    /// turning back a page and `h` went on doing nothing, with nothing
+    /// on screen to say why. A set that is *exactly* the old preset was
+    /// not typed in by hand, so it is taken to mean "Vim" and becomes
+    /// what Vim means now. Anything else -- one key different -- is
+    /// somebody's own choice and is left alone.
+    fn upgraded(self) -> Self {
+        let old_vim = Self {
+            left: Some(Key::J),
+            right: Some(Key::L),
+            up: Some(Key::I),
+            down: Some(Key::K),
+        };
+        if self == old_vim {
+            let mut keys = self;
+            keys.apply(Preset::Vim);
+            keys
+        } else {
+            self
+        }
     }
 
     pub fn get(self, target: NavTarget) -> Option<Key> {
@@ -331,6 +365,43 @@ mod tests {
             t
         };
         assert_eq!(parse(&text), keys);
+    }
+
+    /// What vim itself does, spelled out, because this is the second
+    /// time it has had to be fixed.
+    #[test]
+    fn vim_is_h_left_j_down_k_up_l_right() {
+        let mut keys = NavKeys::default();
+        keys.apply(Preset::Vim);
+        assert_eq!(keys.get(NavTarget::Left), Some(Key::H));
+        assert_eq!(keys.get(NavTarget::Down), Some(Key::J));
+        assert_eq!(keys.get(NavTarget::Up), Some(Key::K));
+        assert_eq!(keys.get(NavTarget::Right), Some(Key::L));
+    }
+
+    /// The file a reader who chose the old Vim preset still has.
+    #[test]
+    fn a_saved_copy_of_the_old_vim_preset_becomes_the_real_one() {
+        let keys = parse("left=J\nright=L\nup=I\ndown=K\n").upgraded();
+        assert!(keys.matches(Preset::Vim));
+        assert_eq!(keys.get(NavTarget::Down), Some(Key::J));
+        assert_eq!(keys.get(NavTarget::Up), Some(Key::K));
+        assert_eq!(keys.get(NavTarget::Left), Some(Key::H));
+    }
+
+    #[test]
+    fn bindings_that_only_resemble_the_old_preset_are_left_alone() {
+        // One key different: somebody chose this.
+        let text = "left=J\nright=L\nup=I\ndown=M\n";
+        assert_eq!(parse(text).upgraded(), parse(text));
+        // Three of the four.
+        let text = "left=J\nright=L\nup=I\n";
+        assert_eq!(parse(text).upgraded(), parse(text));
+        // And the new preset, and no bindings at all, pass through.
+        let mut vim = NavKeys::default();
+        vim.apply(Preset::Vim);
+        assert_eq!(vim.upgraded(), vim);
+        assert_eq!(NavKeys::default().upgraded(), NavKeys::default());
     }
 
     #[test]
