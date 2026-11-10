@@ -691,6 +691,13 @@ fn load_document(path: &Path) -> Result<(PopplerEngine, Vec<PageSize>), String> 
 
 impl SenpaiApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        Self::with_context(&cc.egui_ctx, initial_path)
+    }
+
+    /// Everything `new` does, given only the egui context. Split out so
+    /// the whole app can be driven frame by frame without a window --
+    /// see `app_tests.rs`.
+    fn with_context(ctx: &egui::Context, initial_path: Option<PathBuf>) -> Self {
         let saved = settings::Settings::load();
         let mut app = Self {
             page_count: 0,
@@ -744,10 +751,10 @@ impl SenpaiApp {
             last_shown_page: 0,
             page_flash_until: 0.0,
         };
-        configure_context(&cc.egui_ctx);
-        theme::install(&cc.egui_ctx, app.dark_mode);
+        configure_context(ctx);
+        theme::install(ctx, app.dark_mode);
         if let Some(path) = initial_path {
-            app.open_document(&cc.egui_ctx, &path);
+            app.open_document(ctx, &path);
             // A bad path on the command line is still worth reporting on
             // stderr for CLI use; the window stays up on its empty state
             // rather than exiting, so the user can just pick another file.
@@ -1188,6 +1195,14 @@ impl SenpaiApp {
 
 impl eframe::App for SenpaiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl SenpaiApp {
+    /// One frame of the whole reader: input, then whichever view is
+    /// showing, then the chrome over it.
+    fn frame(&mut self, ctx: &egui::Context) {
         self.pending_evictions.clear();
 
         // Click anywhere off the chrome to dismiss an open menu. Checked
@@ -2335,6 +2350,9 @@ impl SenpaiApp {
         }
     }
 }
+
+#[cfg(test)]
+mod app_tests;
 
 #[cfg(test)]
 mod tests {
