@@ -49,6 +49,7 @@ mod recent;
 mod scroll;
 mod settings;
 mod theme;
+mod touchpad;
 
 use continuous::Fit;
 use eframe::egui;
@@ -197,9 +198,9 @@ fn zoom_note(fit: Option<Fit>, scale: f64) -> String {
 /// be looked at. "W does nothing" is one line of this away from being
 /// either "no W ever arrived" or "W arrived with Ctrl held".
 fn trace_input(ctx: &egui::Context) {
-    let Some(path) = env::var_os("SENPAI_TRACE") else {
+    if env::var_os("SENPAI_TRACE").is_none() {
         return;
-    };
+    }
     let mut out = String::new();
     ctx.input(|i| {
         for event in &i.events {
@@ -226,7 +227,15 @@ fn trace_input(ctx: &egui::Context) {
             }
         }
     });
-    if out.is_empty() {
+    trace(&out);
+}
+
+/// Appends `text` to the `SENPAI_TRACE` file, if there is one.
+fn trace(text: &str) {
+    let Some(path) = env::var_os("SENPAI_TRACE") else {
+        return;
+    };
+    if text.is_empty() {
         return;
     }
     use std::io::Write;
@@ -235,7 +244,7 @@ fn trace_input(ctx: &egui::Context) {
         .append(true)
         .open(path)
     {
-        let _ = file.write_all(out.as_bytes());
+        let _ = file.write_all(text.as_bytes());
     }
 }
 
@@ -549,6 +558,10 @@ struct SenpaiApp {
     /// Whether the page in the paged view is taller than the window,
     /// which decides what Up and Down mean there.
     paged_overflows: bool,
+    /// Pinch factors worked out from the touchpad's own finger
+    /// positions, where the platform delivers no pinch of its own.
+    /// `None` where there is no touchpad to read. See `touchpad.rs`.
+    pinch_rx: Option<Receiver<f32>>,
     /// Where on screen a pinch is centred, for the frame it happens in.
     zoom_focus: Option<egui::Pos2>,
     /// Until when to hold off rendering at a new zoom level. A pinch or
@@ -761,7 +774,16 @@ fn load_document(path: &Path) -> Result<(PopplerEngine, Vec<PageSize>), String> 
 
 impl SenpaiApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
-        Self::with_context(&cc.egui_ctx, initial_path)
+        let mut app = Self::with_context(&cc.egui_ctx, initial_path);
+        // Here and not in `with_context`: this opens a real device and
+        // starts a thread on it, which a test has no business doing.
+        app.pinch_rx = touchpad::watch(&cc.egui_ctx);
+        trace(if app.pinch_rx.is_some() {
+            "touchpad: watching for pinches\n"
+        } else {
+            "touchpad: none readable, pinch comes from the platform or not at all\n"
+        });
+        app
     }
 
     /// Everything `new` does, given only the egui context. Split out so
@@ -788,6 +810,7 @@ impl SenpaiApp {
             paged: continuous::View::new("paged_page"),
             paged_page: usize::MAX,
             paged_overflows: false,
+            pinch_rx: None,
             zoom_focus: None,
             settle_until: 0.0,
             last_avail: egui::Vec2::ZERO,
@@ -1512,8 +1535,32 @@ impl SenpaiApp {
         // number. Outside the key block above on purpose: that block is
         // skipped while the page box has the keyboard, and a pinch has
         // nothing to do with the keyboard.
-        let (pinch, pointer, now) =
-            ctx.input(|i| (i.zoom_delta() as f64, i.pointer.hover_pos(), i.time));
+        let (mut pinch, pointer, now, focused) = ctx.input(|i| {
+            (
+                i.zoom_delta() as f64,
+                i.pointer.hover_pos(),
+                i.time,
+                i.focused,
+            )
+        });
+        // And the pinch read off the touchpad itself. Always drained,
+        // so that what the fingers did while another window had them
+        // does not arrive all at once on coming back; only used while
+        // this window has the keyboard and the pointer, because the
+        // touchpad is the whole desktop's and says nothing about whom
+        // a gesture was meant for.
+        if let Some(rx) = &self.pinch_rx {
+            let raw: f64 = rx.try_iter().map(f64::from).product();
+            if raw != 1.0 {
+                trace(&format!(
+                    "touchpad pinch x{raw:.4} focused={focused} pointer_over={}\n",
+                    pointer.is_some()
+                ));
+            }
+            if focused && pointer.is_some() {
+                pinch *= raw;
+            }
+        }
         let on_chrome =
             pointer.is_some_and(|p| self.bar_rect.contains(p) || self.menu_rect.contains(p));
         if pinch != 1.0 && pinch.is_finite() && pinch > 0.0 && self.has_document() && !on_chrome {
