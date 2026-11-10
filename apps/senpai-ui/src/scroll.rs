@@ -87,9 +87,9 @@ impl WheelStep {
     /// The step, in points.
     pub fn points(self) -> f32 {
         match self {
-            Self::Fine => 45.0,
-            Self::Normal => 80.0,
-            Self::Fast => 130.0,
+            Self::Fine => 90.0,
+            Self::Normal => 160.0,
+            Self::Fast => 260.0,
         }
     }
 }
