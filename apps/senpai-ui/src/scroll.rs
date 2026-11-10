@@ -104,6 +104,44 @@ impl Wheel {
     }
 }
 
+/// Takes this frame's wheel input away from egui, for a [`Scroller`]
+/// to have instead. Returns the frame's time, the time since the last
+/// one, and the input.
+///
+/// Call it on the panel a scroll area is about to be shown in, before
+/// showing it: the scroll area reads the same input at the end of its
+/// own `show`, and whichever of the two gets there first is the one
+/// that scrolls. Nothing is taken unless the pointer is over `ui`, so
+/// a menu open on top keeps the wheel to itself.
+pub fn take_wheel(ui: &egui::Ui) -> (f64, f32, Vec<Wheel>) {
+    let hovered = ui.rect_contains_pointer(ui.max_rect());
+    ui.input_mut(|i| {
+        let mut wheel = Vec::new();
+        if hovered {
+            for event in &i.events {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } = event
+                {
+                    // Ctrl is zoom and Shift is sideways; neither is a
+                    // vertical scroll to interpret.
+                    if modifiers.ctrl || modifiers.command || modifiers.shift {
+                        continue;
+                    }
+                    wheel.extend(Wheel::from_event(*unit, delta.y));
+                }
+            }
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            i.raw_scroll_delta = egui::Vec2::ZERO;
+        }
+        // Capped: after a stall, one long frame should not be
+        // integrated as if the page had been moving all that time.
+        (i.time, i.stable_dt.min(0.05), wheel)
+    })
+}
+
 #[derive(Default)]
 pub struct Scroller {
     /// Distance asked for and not yet travelled.

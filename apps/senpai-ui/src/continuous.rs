@@ -23,7 +23,7 @@
 //! survives both, which is what lets a zoom or a resize leave the same
 //! line of the same page at the top of the window.
 
-use crate::scroll::{Scroller, Wheel};
+use crate::scroll::Scroller;
 use eframe::egui::{self, pos2, vec2, Pos2, Rect};
 use senpai_core::model::PageSize;
 use std::ops::Range;
@@ -366,32 +366,7 @@ impl View {
         // turns it into something that feels like a browser. The scroll
         // area is left with the scrollbar and drag-to-scroll, which it
         // does well.
-        let hovered = ui.rect_contains_pointer(ui.max_rect());
-        let (now, dt, wheel) = ui.input_mut(|i| {
-            let mut wheel = Vec::new();
-            if hovered {
-                for event in &i.events {
-                    if let egui::Event::MouseWheel {
-                        unit,
-                        delta,
-                        modifiers,
-                    } = event
-                    {
-                        // Ctrl is zoom and Shift is sideways; neither
-                        // is this view's to interpret.
-                        if modifiers.ctrl || modifiers.command || modifiers.shift {
-                            continue;
-                        }
-                        wheel.extend(Wheel::from_event(*unit, delta.y));
-                    }
-                }
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                i.raw_scroll_delta = egui::Vec2::ZERO;
-            }
-            // Capped: after a stall, one long frame should not be
-            // integrated as if the page had been moving all that time.
-            (i.time, i.stable_dt.min(0.05), wheel)
-        });
+        let (now, dt, wheel) = crate::scroll::take_wheel(ui);
         let moved = self.scroller.step(now, dt, &wheel);
         if moved != 0.0 {
             target += moved;

@@ -559,6 +559,14 @@ struct SenpaiApp {
     /// page-navigation key. Applied inside the scroll area, which is the
     /// only place the offset can be changed.
     md_scroll: f32,
+    /// The text view's wheel, touchpad and key motion, and where its
+    /// scroll area currently is. The same model the PDF view scrolls
+    /// with, so the two feel alike. See `scroll.rs`.
+    text_scroller: scroll::Scroller,
+    text_offset: f32,
+    /// Set when a text document has just been opened, to put the view
+    /// back at the top: the scroll area's own state outlives documents.
+    text_to_top: bool,
     /// Name shown on the drag-and-drop overlay. Kept after the pointer
     /// leaves so the card still reads correctly while it fades out --
     /// clearing it with the hover would blank the text mid-fade.
@@ -674,6 +682,9 @@ impl SenpaiApp {
             recent: recent::Recent::load(),
             text: None,
             md_scroll: 0.0,
+            text_scroller: scroll::Scroller::default(),
+            text_offset: 0.0,
+            text_to_top: false,
             drop_label: None,
             page_input: String::new(),
             page_editing: false,
@@ -852,6 +863,8 @@ impl SenpaiApp {
         self.current_page = 0;
         self.page_sizes.clear();
         self.md_scroll = 0.0;
+        self.text_scroller.stop();
+        self.text_to_top = true;
         self.text = Some(doc);
         self.doc_path = Some(path.to_path_buf());
         self.set_window_title(ctx, path);
@@ -1606,7 +1619,27 @@ impl SenpaiApp {
                 // text off the window. The panel is the window, and the
                 // window is what the column should answer to.
                 let viewport = ui.available_width();
-                egui::ScrollArea::vertical().show(ui, |ui| {
+
+                // Scrolled by the same model as the PDF view, taking
+                // the wheel before the scroll area can.
+                let (now, dt, wheel) = scroll::take_wheel(ui);
+                if scroll != 0.0 {
+                    self.text_scroller.nudge(scroll);
+                }
+                let moved = self.text_scroller.step(now, dt, &wheel);
+                let wanted = if std::mem::take(&mut self.text_to_top) {
+                    self.text_scroller.stop();
+                    Some(0.0)
+                } else if moved != 0.0 {
+                    Some((self.text_offset + moved).max(0.0))
+                } else {
+                    None
+                };
+                let mut area = egui::ScrollArea::vertical();
+                if let Some(offset) = wanted {
+                    area = area.vertical_scroll_offset(offset);
+                }
+                let out = area.show(ui, |ui| {
                     let width = markdown::column_width(viewport);
                     let gutter = ((viewport - width) / 2.0).max(0.0);
                     ui.horizontal_top(|ui| {
@@ -1627,10 +1660,18 @@ impl SenpaiApp {
                             ui.add_space(60.0 * zoom);
                         });
                     });
-                    if scroll != 0.0 {
-                        ui.scroll_with_delta(egui::vec2(0.0, -scroll));
-                    }
                 });
+                self.text_offset = out.state.offset.y;
+                if wanted.is_some_and(|w| (w - self.text_offset).abs() > 0.5) {
+                    // Asked for one place and got another: that was an
+                    // end of the document, which only the scroll area
+                    // knows the position of. Drop what was in flight,
+                    // or it would be paid out on the way back.
+                    self.text_scroller.stop();
+                }
+                if self.text_scroller.is_active() {
+                    ui.ctx().request_repaint();
+                }
             });
     }
 
