@@ -209,6 +209,23 @@ fn w_stays_a_direction_for_someone_who_bound_it_to_one() {
     });
 }
 
+/// F on a page that is already fitted changes nothing on screen. It
+/// still has to be acknowledged, or it reads as a dead key.
+#[test]
+fn a_fit_key_is_acknowledged_even_when_nothing_changes() {
+    both_modes(|mut r| {
+        assert!(r.time >= r.app.zoom_note_until);
+        r.press(Key::F);
+        assert_eq!(r.app.fit, Some(Fit::Page));
+        assert!(r.app.zoom_note_until > r.time);
+        // And it goes away again.
+        for _ in 0..120 {
+            r.frame(vec![]);
+        }
+        assert!(r.time >= r.app.zoom_note_until);
+    });
+}
+
 /// How a pinch arrives where the platform reports one as a gesture.
 #[test]
 fn a_pinch_zooms() {

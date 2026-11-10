@@ -176,6 +176,17 @@ fn parse_page_number(input: &str, page_count: usize) -> Option<usize> {
     Some(number.clamp(1, page_count) - 1)
 }
 
+/// What the zoom capsule says: the fit by name if there is one, and
+/// the percentage it comes to either way.
+fn zoom_note(fit: Option<Fit>, scale: f64) -> String {
+    let percent = zoom_percent(scale);
+    match fit {
+        Some(Fit::Page) => format!("Fit page · {percent}%"),
+        Some(Fit::Width) => format!("Fit width · {percent}%"),
+        None => format!("{percent}%"),
+    }
+}
+
 /// Largest text file either text view will open. See `read_text`.
 const MAX_TEXT_BYTES: usize = 512 * 1024;
 
@@ -236,6 +247,8 @@ const ZOOM_STEP: f64 = 1.2;
 /// How long the zoom level has to hold still before pages are rendered
 /// at it. Shorter than a pause anyone makes on purpose mid-pinch.
 const ZOOM_SETTLE: f64 = 0.15;
+/// How long the zoom capsule stays up after a change.
+const ZOOM_NOTE: f64 = 1.2;
 const RECENT_IN_MENU: usize = 6;
 /// Budget for an entry's label, in characters. The dropdown's pills do
 /// not wrap or truncate on their own -- a long name would simply push
@@ -493,6 +506,11 @@ struct SenpaiApp {
     settle_until: f64,
     last_avail: egui::Vec2,
     wheel_step: WheelStep,
+    /// Set when the zoom or the fit has just been changed by the
+    /// reader, so the next frame can say what it is now.
+    zoom_changed: bool,
+    /// Until when the capsule saying so stays up.
+    zoom_note_until: f64,
 
     dark_mode: bool,
     auto_hide_enabled: bool,
@@ -721,6 +739,8 @@ impl SenpaiApp {
             zoom_focus: None,
             settle_until: 0.0,
             last_avail: egui::Vec2::ZERO,
+            zoom_changed: false,
+            zoom_note_until: 0.0,
             wheel_step: saved.wheel_step,
             dark_mode: true,
             auto_hide_enabled: true,
@@ -1142,6 +1162,7 @@ impl SenpaiApp {
             self.scale = self.shown_scale;
         }
         self.scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        self.zoom_changed = true;
     }
 
     /// Back to the level a document opens at -- the 100% the bar reports.
@@ -1154,6 +1175,7 @@ impl SenpaiApp {
             self.fit = None;
         }
         self.scale = DEFAULT_SCALE;
+        self.zoom_changed = true;
     }
 
     /// Fits pages to the window. A PDF matter only: text already wraps
@@ -1161,6 +1183,11 @@ impl SenpaiApp {
     fn set_fit(&mut self, fit: Fit) {
         if self.text.is_none() {
             self.fit = Some(fit);
+            // Even when it was this fit already. F on a page that is
+            // fitted changes nothing on screen, and a key that changes
+            // nothing looks like a key that does nothing; the note is
+            // how the reader can tell the difference.
+            self.zoom_changed = true;
         }
     }
 
@@ -1505,6 +1532,26 @@ impl SenpaiApp {
             egui::vec2(16.0, -16.0),
             hint_t,
             "rendering…",
+        );
+
+        // What the zoom is now, for a moment after it was changed.
+        if std::mem::take(&mut self.zoom_changed) {
+            self.zoom_note_until = now + ZOOM_NOTE;
+        }
+        let noting = now < self.zoom_note_until;
+        if noting {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                self.zoom_note_until - now,
+            ));
+        }
+        let note_t = ctx.animate_bool_with_time(egui::Id::new("zoom_note"), noting, theme::T_PANEL);
+        theme::status_pill(
+            ctx,
+            "zoom_note_pill",
+            egui::Align2::CENTER_BOTTOM,
+            egui::vec2(0.0, -16.0),
+            note_t,
+            &zoom_note(self.fit, self.shown_scale),
         );
     }
 
@@ -2218,7 +2265,7 @@ impl SenpaiApp {
             }
             ui.label(
                 egui::RichText::new(
-                    "F fits the page, W fits the width. Pinch, or + and −, to zoom.",
+                    "F fits the page, W the width. Ctrl + scroll, a pinch, or + and −, zoom.",
                 )
                 .color(theme::text_faint())
                 .size(10.5),
@@ -2358,7 +2405,8 @@ mod app_tests;
 mod tests {
     use super::{
         configure_context, elide, is_markdown, is_plain_text, parse_page_number,
-        pick_dropped_document, should_dismiss_menu, zoom_percent, DEFAULT_SCALE, RECENT_NAME_CHARS,
+        pick_dropped_document, should_dismiss_menu, zoom_note, zoom_percent, Fit, DEFAULT_SCALE,
+        RECENT_NAME_CHARS,
     };
     use eframe::egui::{self, pos2, Rect};
     use std::path::{Path, PathBuf};
@@ -2561,6 +2609,16 @@ mod tests {
         assert_eq!(parse_page_number("", 300), None);
         assert_eq!(parse_page_number("abc", 300), None);
         assert_eq!(parse_page_number("5", 0), None);
+    }
+
+    #[test]
+    fn the_zoom_note_names_a_fit_and_always_gives_the_percentage() {
+        assert_eq!(zoom_note(Some(Fit::Page), DEFAULT_SCALE), "Fit page · 100%");
+        assert_eq!(
+            zoom_note(Some(Fit::Width), DEFAULT_SCALE * 1.5),
+            "Fit width · 150%"
+        );
+        assert_eq!(zoom_note(None, DEFAULT_SCALE * 0.5), "50%");
     }
 
     #[test]
