@@ -45,6 +45,7 @@ mod continuous;
 mod keybinds;
 mod markdown;
 mod recent;
+mod scroll;
 mod theme;
 
 use eframe::egui;

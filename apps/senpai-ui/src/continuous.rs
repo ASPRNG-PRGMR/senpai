@@ -23,6 +23,7 @@
 //! survives both, which is what lets a zoom or a resize leave the same
 //! line of the same page at the top of the window.
 
+use crate::scroll::{Scroller, Wheel};
 use eframe::egui::{self, pos2, vec2, Pos2, Rect};
 use senpai_core::model::PageSize;
 use std::ops::Range;
@@ -278,6 +279,8 @@ pub struct View {
     page_steps: i32,
     /// Finer movement asked for since the last frame, in window heights.
     scroll_screens: f32,
+    /// Wheel, touchpad and key motion in progress. See `scroll.rs`.
+    scroller: Scroller,
 }
 
 impl Default for View {
@@ -290,6 +293,7 @@ impl Default for View {
             reanchor: true,
             page_steps: 0,
             scroll_screens: 0.0,
+            scroller: Scroller::default(),
         }
     }
 }
@@ -347,7 +351,63 @@ impl View {
             };
             forced = true;
         }
+        if forced {
+            // Sent somewhere on purpose: whatever glide or coast was in
+            // progress belonged to the place just left.
+            self.scroller.stop();
+        }
         let screens = std::mem::take(&mut self.scroll_screens);
+        if screens != 0.0 {
+            self.scroller.nudge(screens * avail.y);
+        }
+
+        // The wheel is taken here, before the scroll area can have it.
+        // egui would turn it into its own short eased step; `Scroller`
+        // turns it into something that feels like a browser. The scroll
+        // area is left with the scrollbar and drag-to-scroll, which it
+        // does well.
+        let hovered = ui.rect_contains_pointer(ui.max_rect());
+        let (now, dt, wheel) = ui.input_mut(|i| {
+            let mut wheel = Vec::new();
+            if hovered {
+                for event in &i.events {
+                    if let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                    } = event
+                    {
+                        // Ctrl is zoom and Shift is sideways; neither
+                        // is this view's to interpret.
+                        if modifiers.ctrl || modifiers.command || modifiers.shift {
+                            continue;
+                        }
+                        wheel.extend(Wheel::from_event(*unit, delta.y));
+                    }
+                }
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+            }
+            // Capped: after a stall, one long frame should not be
+            // integrated as if the page had been moving all that time.
+            (i.time, i.stable_dt.min(0.05), wheel)
+        });
+        let moved = self.scroller.step(now, dt, &wheel);
+        if moved != 0.0 {
+            target += moved;
+            forced = true;
+            if target <= 0.0 || target >= max_offset {
+                // An end of the document. Anything still owed would
+                // otherwise sit there and be paid out the moment the
+                // reader scrolled back the other way.
+                self.scroller.stop();
+            }
+        }
+        if self.scroller.is_active() {
+            // Motion without input: egui only repaints when something
+            // happens, and a glide is something happening.
+            ui.ctx().request_repaint();
+        }
 
         let mut area = egui::ScrollArea::vertical()
             .id_salt("continuous_pages")
@@ -375,9 +435,6 @@ impl View {
                     layout.page_rect(page, origin),
                     layout.is_shrunk(page),
                 );
-            }
-            if screens != 0.0 {
-                ui.scroll_with_delta(vec2(0.0, -screens * viewport.height()));
             }
             visible
         });
@@ -572,8 +629,23 @@ mod tests {
         pages: &[PageSize],
         scale: f64,
     ) -> (Shown, Vec<(usize, Rect)>) {
+        frame_with(ctx, view, pages, scale, 0.0, Vec::new())
+    }
+
+    /// The same, at a given time and with input events.
+    fn frame_with(
+        ctx: &egui::Context,
+        view: &mut View,
+        pages: &[PageSize],
+        scale: f64,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> (Shown, Vec<(usize, Rect)>) {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            time: Some(time),
+            predicted_dt: 1.0 / 60.0,
+            events,
             ..Default::default()
         };
         let mut painted = Vec::new();
@@ -673,6 +745,109 @@ mod tests {
         let mut fresh = View::default();
         let (shown, _) = frame(&ctx, &mut fresh, &pages, 1.0);
         assert_eq!(shown.current_page, 0);
+    }
+
+    fn wheel(lines_down: f32) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, -lines_down),
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Runs frames with the pointer over the page until nothing is
+    /// moving, and returns where the top page ended up.
+    fn run_until_still(
+        ctx: &egui::Context,
+        view: &mut View,
+        pages: &[PageSize],
+        time: &mut f64,
+        mut events: Vec<egui::Event>,
+    ) -> (usize, f32) {
+        let mut last = (0, 0.0);
+        for _ in 0..600 {
+            *time += 1.0 / 60.0;
+            let (_, painted) =
+                frame_with(ctx, view, pages, 1.0, *time, std::mem::take(&mut events));
+            last = (painted[0].0, painted[0].1.min.y);
+            if !view.scroller.is_active() {
+                break;
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn a_wheel_notch_scrolls_a_browser_s_worth_and_glides_there() {
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let pages = [LETTER; 10];
+        let mut time = 0.0;
+        let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
+        run_until_still(&ctx, &mut view, &pages, &mut time, vec![hover]);
+
+        // One frame in, it has started but not arrived.
+        time += 1.0 / 60.0;
+        let (_, painted) = frame_with(&ctx, &mut view, &pages, 1.0, time, vec![wheel(1.0)]);
+        let first = PAGE_GAP - painted[0].1.min.y;
+        assert!(
+            first > 0.0 && first < crate::scroll::LINE_PT / 2.0,
+            "moved {first} in the first frame"
+        );
+        let (page, top) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
+        assert_eq!(page, 0);
+        assert!(
+            (PAGE_GAP - top - crate::scroll::LINE_PT).abs() < 1.0,
+            "ended {} down",
+            PAGE_GAP - top
+        );
+    }
+
+    #[test]
+    fn a_touchpad_flick_crosses_pages() {
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let pages = [LETTER; 10];
+        let mut time = 0.0;
+        let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
+        run_until_still(&ctx, &mut view, &pages, &mut time, vec![hover]);
+        // Six frames at 80 points each: 480 points under the fingers.
+        for _ in 0..6 {
+            time += 1.0 / 60.0;
+            let event = egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -80.0),
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(&ctx, &mut view, &pages, 1.0, time, vec![event]);
+        }
+        let (page, _) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
+        assert!(page >= 3, "a flick only reached page {page}");
+    }
+
+    #[test]
+    fn scrolling_up_at_the_top_leaves_nothing_owed() {
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let pages = [LETTER; 10];
+        let mut time = 0.0;
+        let hover = egui::Event::PointerMoved(pos2(400.0, 300.0));
+        run_until_still(&ctx, &mut view, &pages, &mut time, vec![hover]);
+        let (page, top) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![wheel(-5.0)]);
+        assert_eq!((page, top), (0, PAGE_GAP));
+        assert!(!view.scroller.is_active());
+    }
+
+    #[test]
+    fn the_arrow_key_nudge_glides_a_fifth_of_the_window() {
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let pages = [LETTER; 10];
+        let mut time = 0.0;
+        run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
+        view.scroll_by_screens(0.2);
+        let (_, top) = run_until_still(&ctx, &mut view, &pages, &mut time, vec![]);
+        assert!((PAGE_GAP - top - 0.2 * SCREEN.y).abs() < 1.0);
     }
 
     #[test]
