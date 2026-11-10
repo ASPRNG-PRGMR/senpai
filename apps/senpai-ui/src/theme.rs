@@ -793,6 +793,45 @@ pub fn counter_label(ui: &mut egui::Ui, label: &str, slot_w: f32) {
     );
 }
 
+/// The page number in the top bar, as something that can be typed into.
+///
+/// It sits on a faint grey box, and that box is the whole affordance:
+/// nothing else on the bar has one, so it reads as "this one takes
+/// input" without a label saying so. Focused, the box picks up the
+/// accent outline, which is the bar's one colour and already means
+/// "this is the active thing".
+///
+/// `digits_w` is the width of the widest number the document can ask
+/// for, so the box does not change size between page 9 and page 10.
+pub fn page_field(ui: &mut egui::Ui, text_buf: &mut String, digits_w: f32) -> egui::Response {
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(digits_w + 16.0, PILL_HEIGHT - 4.0), Sense::hover());
+    let id = ui.id().with("page_field");
+    let focused = ui.memory(|m| m.has_focus(id));
+    ui.painter().rect(
+        rect,
+        Rounding::same(7.0),
+        veil(if focused { 40 } else { 26 }),
+        if focused {
+            Stroke::new(1.0_f32, accent())
+        } else {
+            Stroke::NONE
+        },
+    );
+    ui.put(
+        rect,
+        egui::TextEdit::singleline(text_buf)
+            .id(id)
+            .frame(false)
+            .margin(egui::Margin::symmetric(4.0, 0.0))
+            .font(egui::FontId::proportional(COUNTER_FONT))
+            .text_color(text())
+            .horizontal_align(egui::Align::Center)
+            .vertical_align(egui::Align::Center)
+            .desired_width(digits_w + 8.0),
+    )
+}
+
 /// The counter as it appears on its own, with the bar hidden: a capsule
 /// centred at the top of the window.
 ///

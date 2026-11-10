@@ -135,13 +135,13 @@ const CONTINUOUS_MAX_WINDOW: usize = CACHE_CAPACITY - 4;
 /// How long the lone page capsule takes to leave. Shorter than the
 /// bar's own fade so it is out of the way before the bar is fully there.
 const PAGE_PILL_FADE: f32 = 0.09;
-/// Width to reserve for the page counter.
+/// Width to reserve for the page number.
 ///
-/// Measured on the widest text it will ever hold rather than on what it
-/// holds now: sized to the current number, the whole right-hand group
-/// would shift sideways on the turn from page 9 to page 10.
-fn page_counter_width(ctx: &egui::Context, page_count: usize) -> f32 {
-    let widest = format!("{page_count} / {page_count}");
+/// Measured on the widest number the document can ask for rather than
+/// on the current one: sized to what it holds now, the whole right-hand
+/// group would shift sideways on the turn from page 9 to page 10.
+fn page_number_width(ctx: &egui::Context, page_count: usize) -> f32 {
+    let widest = "8".repeat(page_count.to_string().len());
     ctx.fonts(|f| {
         f.layout_no_wrap(
             widest,
@@ -151,6 +151,24 @@ fn page_counter_width(ctx: &egui::Context, page_count: usize) -> f32 {
     })
     .size()
     .x
+}
+
+/// Turns what was typed into the page box into a page index.
+///
+/// Out-of-range numbers are clamped rather than refused: someone who
+/// types 9999 into a 300-page document wants the end of it, and "0"
+/// can only mean the start. Only an empty box is nothing to act on.
+fn parse_page_number(input: &str, page_count: usize) -> Option<usize> {
+    if page_count == 0 {
+        return None;
+    }
+    let digits: String = input.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    // A number too long to parse is, for this purpose, just a big one.
+    let number = digits.parse::<usize>().unwrap_or(usize::MAX);
+    Some(number.clamp(1, page_count) - 1)
 }
 
 /// Largest text file either text view will open. See `read_text`.
@@ -545,6 +563,11 @@ struct SenpaiApp {
     /// clearing it with the hover would blank the text mid-fade.
     drop_label: Option<String>,
 
+    /// What is in the bar's page box. Follows `current_page` until the
+    /// box has focus, then belongs to whoever is typing.
+    page_input: String,
+    page_editing: bool,
+
     /// When the current render request started, for `RENDER_HINT_DELAY`.
     render_started: Option<f64>,
     /// Page the counter last reported, so a turn can be noticed.
@@ -651,6 +674,8 @@ impl SenpaiApp {
             text: None,
             md_scroll: 0.0,
             drop_label: None,
+            page_input: String::new(),
+            page_editing: false,
             render_started: None,
             last_shown_page: 0,
             page_flash_until: 0.0,
@@ -1101,6 +1126,16 @@ impl SenpaiApp {
     fn prev_page(&mut self) {
         self.current_page = self.current_page.saturating_sub(1);
     }
+    /// Goes straight to `page`, in whichever view is showing.
+    fn go_to_page(&mut self, page: usize) {
+        if self.page_count == 0 {
+            return;
+        }
+        self.current_page = page.min(self.page_count - 1);
+        if self.view_mode == ViewMode::Continuous {
+            self.continuous.go_to_page(self.current_page);
+        }
+    }
     fn zoom_in(&mut self) {
         self.scale = (self.scale * 1.2).min(6.0);
         self.clear_pending_prefetch();
@@ -1189,7 +1224,11 @@ impl eframe::App for SenpaiApp {
                 }
                 self.rebinding = None;
             }
-        } else {
+        } else if !ctx.wants_keyboard_input() {
+            // Skipped entirely while the page box has the keyboard. The
+            // keys it needs are the ones this block would act on: a
+            // digit could be someone's bound direction, the arrows move
+            // its cursor, and `-` and `+` would zoom mid-number.
             let keys = self.nav_keys;
             let (nav, want_zoom_in, want_zoom_out, want_zoom_reset) = ctx.input(|i| {
                 // A direction fires on its built-in keys or on whatever
@@ -1318,6 +1357,9 @@ impl eframe::App for SenpaiApp {
         let bar_visible = !self.auto_hide_enabled
             || hovering_top
             || self.open_menu.is_some()
+            // Or the box being typed into would slide away the moment
+            // the pointer drifted off the top edge.
+            || self.page_editing
             || !self.has_document();
 
         self.poll_pending_open(ctx);
@@ -1779,15 +1821,9 @@ impl SenpaiApp {
                                     }
                                     if self.page_count > 0 {
                                         ui.add_space(14.0);
-                                        theme::counter_label(
-                                            ui,
-                                            &format!(
-                                                "{} / {}",
-                                                self.current_page + 1,
-                                                self.page_count
-                                            ),
-                                            page_counter_width(ctx, self.page_count),
-                                        );
+                                        self.page_box(ui, ctx);
+                                    } else {
+                                        self.page_editing = false;
                                     }
                                 },
                             );
@@ -1818,6 +1854,56 @@ impl SenpaiApp {
             let closing = self.open_menu.is_none();
             self.show_menu_dropdown(ctx, menu, bar_width, open_t * fade, closing);
         }
+    }
+
+    /// The bar's page readout: a box holding the current page, which
+    /// can be typed into, and the total beside it.
+    ///
+    /// Enter goes to the page; Escape, or clicking anywhere else, puts
+    /// the number back. Called inside a right-to-left layout, so the
+    /// total is added first and the box ends up on its left.
+    fn page_box(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(
+            egui::RichText::new(format!("/ {}", self.page_count))
+                .color(theme::text())
+                .size(theme::COUNTER_FONT),
+        );
+        ui.add_space(5.0);
+
+        if !self.page_editing {
+            self.page_input = (self.current_page + 1).to_string();
+        }
+        let response = theme::page_field(
+            ui,
+            &mut self.page_input,
+            page_number_width(ctx, self.page_count),
+        )
+        .on_hover_text("Type a page number, then Enter");
+        // Dropped as they are typed rather than rejected at the end, so
+        // the box can never hold something Enter would have to refuse.
+        self.page_input.retain(|c| c.is_ascii_digit());
+
+        if response.gained_focus() {
+            // Select the lot: the number is there to be replaced, and
+            // having to clear it first is two keystrokes nobody wants.
+            if let Some(mut state) = egui::TextEdit::load_state(ctx, response.id) {
+                use egui::text::{CCursor, CCursorRange};
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(0),
+                    CCursor::new(self.page_input.chars().count()),
+                )));
+                state.store(ctx, response.id);
+            }
+        }
+        if response.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some(page) = parse_page_number(&self.page_input, self.page_count) {
+                self.go_to_page(page);
+            }
+        }
+        if response.clicked_elsewhere() {
+            response.surrender_focus();
+        }
+        self.page_editing = response.has_focus();
     }
 
     fn menu_button(&mut self, ui: &mut egui::Ui, label: &str, kind: Menu) {
@@ -2152,8 +2238,8 @@ impl SenpaiApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_context, elide, is_markdown, is_plain_text, pick_dropped_document,
-        should_dismiss_menu, zoom_percent, DEFAULT_SCALE, RECENT_NAME_CHARS,
+        configure_context, elide, is_markdown, is_plain_text, parse_page_number,
+        pick_dropped_document, should_dismiss_menu, zoom_percent, DEFAULT_SCALE, RECENT_NAME_CHARS,
     };
     use eframe::egui::{self, pos2, Rect};
     use std::path::{Path, PathBuf};
@@ -2333,6 +2419,29 @@ mod tests {
         );
         configure_context(&ctx);
         assert!(!ctx.options(|o| o.zoom_with_keyboard));
+    }
+
+    #[test]
+    fn a_typed_page_number_is_one_based() {
+        assert_eq!(parse_page_number("1", 300), Some(0));
+        assert_eq!(parse_page_number("42", 300), Some(41));
+        assert_eq!(parse_page_number("300", 300), Some(299));
+    }
+
+    /// Clamped, not refused: past the end means the end.
+    #[test]
+    fn a_page_number_out_of_range_goes_to_the_nearest_end() {
+        assert_eq!(parse_page_number("0", 300), Some(0));
+        assert_eq!(parse_page_number("9999", 300), Some(299));
+        // Too long for a usize at all.
+        assert_eq!(parse_page_number(&"9".repeat(40), 300), Some(299));
+    }
+
+    #[test]
+    fn an_empty_page_box_goes_nowhere() {
+        assert_eq!(parse_page_number("", 300), None);
+        assert_eq!(parse_page_number("abc", 300), None);
+        assert_eq!(parse_page_number("5", 0), None);
     }
 
     #[test]
