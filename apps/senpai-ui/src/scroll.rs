@@ -40,9 +40,10 @@ use std::collections::VecDeque;
 /// between runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum WheelStep {
-    /// About a line of text at a reading zoom. The default: the wheel
-    /// can land on any line, and a touchpad that reports itself as
-    /// notches (as it does under Wine) tracks the fingers closely.
+    /// A couple of lines of text at a reading zoom. The default: small
+    /// enough to stop on the line wanted, large enough that getting
+    /// down a page is not a chore. It was 30 points at first, which was
+    /// exact and tiresome.
     #[default]
     Fine,
     Normal,
@@ -77,9 +78,9 @@ impl WheelStep {
     /// The step, in points.
     pub fn points(self) -> f32 {
         match self {
-            Self::Fine => 30.0,
-            Self::Normal => 60.0,
-            Self::Fast => 120.0,
+            Self::Fine => 45.0,
+            Self::Normal => 80.0,
+            Self::Fast => 130.0,
         }
     }
 }
