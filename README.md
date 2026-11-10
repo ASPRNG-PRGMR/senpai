@@ -164,3 +164,16 @@ Remaining before this is a real release artifact: verifying in a genuinely clean
 ## Philosophy on AI
 
 AI is an enhancement, not the product. Every AI capability is implemented as an optional plugin on top of the core reader — the core itself never depends on AI to function.
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE), or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT), or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+This covers SENPAI's own source. The Windows bundle also ships poppler and its dependencies as separate DLLs, each under its own licence — poppler itself is GPL.

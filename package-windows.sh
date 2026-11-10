@@ -101,6 +101,10 @@ for key in "${!seen[@]}"; do
     count=$((count + 1))
 done
 
+# SENPAI's own licence travels with it. Both files, since it is offered
+# under either and the choice is the recipient's.
+cp LICENSE-MIT LICENSE-APACHE "$STAGE/"
+
 cat > "$STAGE/README.txt" <<'TXT'
 SENPAI -- a fast, minimal PDF reader.
 
@@ -108,9 +112,13 @@ Run senpai.exe. Every DLL in this folder is required; keep them beside
 the executable. Open a document with Files -> Open (or Ctrl+O), or pass a
 path on the command line.
 
-Poppler and several of its dependencies are LGPL; they are linked
-dynamically and shipped as separate DLLs here so they remain replaceable,
-which is what the LGPL requires.
+SENPAI itself is dual-licensed under the MIT license or the Apache
+License 2.0, at your option; see LICENSE-MIT and LICENSE-APACHE.
+
+That covers SENPAI's own code only. Poppler is GPL, and several of the
+libraries beside it are LGPL; each remains under its own licence. They
+are linked dynamically and shipped as separate DLLs here so they remain
+replaceable.
 TXT
 
 echo "==> bundled $count DLL(s) from $DLL_DIR"
