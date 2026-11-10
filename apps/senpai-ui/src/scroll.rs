@@ -18,6 +18,15 @@
 //! - **A touchpad is followed directly.** Fine-grained input is applied
 //!   almost as it arrives; easing it would put the page behind the
 //!   fingers.
+//! - **A touchpad reported in lines is geared to its speed.** Windows,
+//!   and Wine with it, reports a touchpad as fractions of a wheel line
+//!   rather than as a distance, so how far a "line" goes is ours to
+//!   decide -- and no single answer is right. Small enough to place a
+//!   line of text under slow fingers is far too small to get anywhere;
+//!   large enough to get somewhere makes slow fingers twitchy. So it
+//!   depends on how fast the fingers are moving: under a third of the
+//!   full distance when they creep, all of it when they sweep. This is
+//!   the same idea as pointer acceleration, and for the same reason.
 //! - **A flick keeps going.** When fine-grained input stops while still
 //!   moving fast, the page coasts on at that speed and slows down on
 //!   its own. Flick again while it is coasting and the speeds add.
@@ -109,15 +118,38 @@ const MIN_FLICK: f32 = 300.0;
 /// Ceiling on coasting speed, so stacked flicks cannot run away.
 const MAX_SPEED: f32 = 16000.0;
 
-/// One piece of scroll input, in points. Positive is further down the
-/// document.
+/// How far a touchpad's "line" goes when the fingers are moving fast.
+const TOUCH_LINE_PT: f32 = 100.0;
+/// The share of that it goes when they are barely moving.
+const TOUCH_SLOW_GAIN: f32 = 0.3;
+/// Below this speed the fingers are placing something, and get the slow
+/// gain; above the second they are travelling, and get all of it. In
+/// points per second at the full distance. Between the two the gain
+/// rises smoothly, so there is no speed at which the page lurches.
+const TOUCH_SLOW_SPEED: f32 = 120.0;
+const TOUCH_FAST_SPEED: f32 = 900.0;
+
+/// The gearing for touchpad input arriving at `speed`.
+fn touch_gain(speed: f32) -> f32 {
+    let t =
+        ((speed.abs() - TOUCH_SLOW_SPEED) / (TOUCH_FAST_SPEED - TOUCH_SLOW_SPEED)).clamp(0.0, 1.0);
+    // Smoothstep: flat at both ends, so the gain eases in and out of
+    // the ramp instead of turning a corner.
+    let eased = t * t * (3.0 - 2.0 * t);
+    TOUCH_SLOW_GAIN + (1.0 - TOUCH_SLOW_GAIN) * eased
+}
+
+/// One piece of scroll input. Positive is further down the document.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Wheel {
     /// Whole clicks of a detented wheel.
     Notch(f32),
-    /// Fine-grained movement in points: a touchpad, or a wheel with no
-    /// detents.
+    /// Fine-grained movement in points: a touchpad that says how far
+    /// the fingers went. Followed as given.
     Stream(f32),
+    /// Fine-grained movement in fractions of a wheel line: a touchpad
+    /// as Windows reports one. Geared by speed; see [`touch_gain`].
+    Touch(f32),
 }
 
 impl Wheel {
@@ -143,7 +175,9 @@ impl Wheel {
                 if whole {
                     Self::Notch(down * line_pt)
                 } else {
-                    Self::Stream(down * line_pt)
+                    // Not scaled by the wheel step: that is a setting
+                    // about a wheel, and this is not one.
+                    Self::Touch(down)
                 }
             }
             // Rare, and coarse by definition; several notches' worth.
@@ -210,6 +244,10 @@ pub struct Scroller {
     samples: VecDeque<(f64, f32)>,
     streaming: bool,
     last_stream: f64,
+    /// Recent touchpad-in-lines input before gearing, one entry per
+    /// frame: (time, points at the full distance). Its speed is what
+    /// the gearing goes by.
+    touches: VecDeque<(f64, f32)>,
 }
 
 impl Scroller {
@@ -237,11 +275,16 @@ impl Scroller {
     /// last frame, `input` whatever arrived in between.
     pub fn step(&mut self, now: f64, dt: f32, input: &[Wheel]) -> f32 {
         let mut streamed = 0.0;
+        let mut touched = 0.0;
         for event in input {
             match *event {
                 Wheel::Notch(points) => self.notch(points),
                 Wheel::Stream(points) => streamed += points,
+                Wheel::Touch(lines) => touched += lines * TOUCH_LINE_PT,
             }
+        }
+        if touched != 0.0 {
+            streamed += touched * touch_gain(self.touch_speed(now, dt, touched));
         }
         if streamed != 0.0 {
             self.stream(now, streamed);
@@ -270,6 +313,30 @@ impl Scroller {
             }
         }
         moved
+    }
+
+    /// Records this frame's touchpad input and returns how fast the
+    /// fingers have been going, in points per second at the full
+    /// distance, averaged over the last [`VELOCITY_WINDOW`].
+    ///
+    /// Averaged because one frame's worth is noisy -- events and frames
+    /// fall in and out of step -- and a gain that followed the noise
+    /// would make the page shimmer.
+    fn touch_speed(&mut self, now: f64, dt: f32, nominal: f32) -> f32 {
+        self.touches.push_back((now, nominal));
+        while self
+            .touches
+            .front()
+            .is_some_and(|&(t, _)| now - t > VELOCITY_WINDOW)
+        {
+            self.touches.pop_front();
+        }
+        let first = self.touches.front().map_or(now, |&(t, _)| t);
+        // The window covers the frames between its first and last
+        // sample, plus the one that led up to the first.
+        let span = (now - first) as f32 + dt.max(0.001);
+        let total: f32 = self.touches.iter().map(|&(_, p)| p).sum();
+        total / span
     }
 
     fn notch(&mut self, points: f32) {
@@ -393,18 +460,89 @@ mod tests {
         assert_eq!(Wheel::from_event(Point, 0.0, STEP), None);
     }
 
-    /// Windows reports a touchpad in fractions of a line.
+    /// Windows reports a touchpad in fractions of a line. It is kept
+    /// in lines, not scaled by the wheel step.
     #[test]
-    fn a_fraction_of_a_line_is_fine_grained_input_not_a_notch() {
+    fn a_fraction_of_a_line_is_a_touchpad_not_a_notch() {
         use egui::MouseWheelUnit::Line;
         assert_eq!(
             Wheel::from_event(Line, -0.25, STEP),
-            Some(Wheel::Stream(0.25 * STEP))
+            Some(Wheel::Touch(0.25))
         );
         assert_eq!(
-            Wheel::from_event(Line, -1.5, STEP),
-            Some(Wheel::Stream(1.5 * STEP))
+            Wheel::from_event(Line, -1.5, 999.0),
+            Some(Wheel::Touch(1.5))
         );
+    }
+
+    /// Feeds touchpad-in-lines input, `lines` on each of `frames`
+    /// frames, and returns the distance covered including any coast.
+    fn touch(lines: f32, frames: usize) -> f32 {
+        let mut s = Scroller::default();
+        let mut now = 1.0;
+        let mut total = 0.0;
+        for _ in 0..frames {
+            now += DT as f64;
+            total += s.step(now, DT, &[Wheel::Touch(lines)]);
+        }
+        total + settle(&mut s, &mut now).0
+    }
+
+    #[test]
+    fn the_touch_gain_is_low_when_slow_full_when_fast_and_never_steps() {
+        assert_eq!(touch_gain(0.0), TOUCH_SLOW_GAIN);
+        assert_eq!(touch_gain(TOUCH_SLOW_SPEED), TOUCH_SLOW_GAIN);
+        assert_eq!(touch_gain(TOUCH_FAST_SPEED), 1.0);
+        assert_eq!(touch_gain(1.0e6), 1.0);
+        // The same going up as going down.
+        assert_eq!(touch_gain(-500.0), touch_gain(500.0));
+        // Rising all the way, with no jump anywhere on the ramp.
+        let mut last = touch_gain(0.0);
+        for speed in (0..=1000).step_by(10) {
+            let gain = touch_gain(speed as f32);
+            assert!(gain >= last && gain - last < 0.03, "at {speed}");
+            last = gain;
+        }
+    }
+
+    /// Creeping fingers: a hundredth of a line a frame is 60pt/s at the
+    /// full distance, well inside the slow range.
+    #[test]
+    fn slow_fingers_on_a_touchpad_move_the_page_a_little_at_a_time() {
+        let total = touch(0.01, 60);
+        let full = 0.01 * 60.0 * TOUCH_LINE_PT;
+        assert!(
+            (total - full * TOUCH_SLOW_GAIN).abs() < 0.5,
+            "moved {total} of a possible {full}"
+        );
+    }
+
+    /// Sweeping fingers: a third of a line a frame is 2000pt/s. All of
+    /// the distance, and then a coast on top of it.
+    #[test]
+    fn fast_fingers_on_a_touchpad_go_the_full_distance_and_then_flick() {
+        let total = touch(1.0 / 3.0, 9);
+        let dragged = 9.0 / 3.0 * TOUCH_LINE_PT;
+        assert!(
+            total > dragged + 700.0,
+            "went {total}, only {} past the drag",
+            total - dragged
+        );
+    }
+
+    /// In between there is no cliff: a little faster always goes a
+    /// little further, never a lot.
+    #[test]
+    fn a_touchpad_gets_faster_smoothly_as_the_fingers_do() {
+        let mut last = 0.0;
+        for hundredths in 1..=12 {
+            // Short of the flick threshold throughout, so this is the
+            // gearing alone.
+            let per_frame = hundredths as f32 / 100.0 * 0.35;
+            let total = touch(per_frame, 30);
+            assert!(total > last, "{per_frame} lines a frame went {total}");
+            last = total;
+        }
     }
 
     #[test]
