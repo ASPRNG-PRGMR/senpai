@@ -46,16 +46,28 @@ const ROOT: &str = r"Z:\";
 #[cfg(not(windows))]
 const ROOT: &str = "/";
 
-/// A change in finger spread smaller than this, as a share of the
-/// spread, is not yet a pinch. Two fingers resting on a pad are never
-/// quite still.
-const PINCH_START: f32 = 0.06;
-/// The same for the fingers' midpoint moving, which is a scroll.
-const SCROLL_START: f32 = 0.10;
+/// How far the spread must change, as a share of itself, before a
+/// gesture can be called a pinch. Deliberately not small: this much has
+/// to go by before anything happens, and what it buys is that a scroll
+/// has time to show itself as one first.
+const PINCH_START: f32 = 0.15;
+/// How far the fingers' midpoint must move, on the same scale, for the
+/// gesture to be called a scroll.
+const SCROLL_START: f32 = 0.08;
 /// How much more the spread must have changed than the midpoint has
-/// moved (or the reverse) for the gesture to be called one or the
-/// other. Below this it is still ambiguous and nothing is decided.
-const DOMINANCE: f32 = 1.4;
+/// moved for a pinch. Under 2 on purpose: a pinch made by holding the
+/// thumb still and moving one finger shifts the midpoint by exactly
+/// half of what it changes the spread.
+const DOMINANCE: f32 = 1.6;
+/// Midpoint travel, on the same scale, past which an undecided gesture
+/// is a scroll whatever else is true of it. Nobody carries a pinch a
+/// third of its own width across the pad.
+const SCROLL_FOR_CERTAIN: f32 = 0.30;
+/// Reports ignored after the second finger lands. A fingertip arriving
+/// on the pad rolls onto it, and its reported position slides a little
+/// as it does; measuring from the first report would count that slide
+/// as the start of a gesture.
+const SETTLE_REPORTS: u32 = 3;
 /// Most fingers tracked. More than a hand has is not a pinch.
 const SLOTS: usize = 10;
 
@@ -72,15 +84,21 @@ enum Gesture {
 
 /// Turns successive finger positions into zoom factors.
 ///
-/// Decides once per touch, and sticks to it. A gesture that starts as a
-/// scroll stays a scroll however the fingers drift, and one that starts
-/// as a pinch stays a pinch -- otherwise a scroll with slightly
-/// spreading fingers would zoom the page as it went.
+/// The hard part is not measuring a pinch, it is not mistaking a scroll
+/// for one, and the rules are weighted that way: a scroll taken for a
+/// pinch resizes the page under someone who was only trying to read
+/// on, while a pinch that takes a moment longer to start costs nothing.
+///
+/// It decides once per touch, and sticks to it. A gesture that starts
+/// as a scroll stays a scroll however the fingers drift, and one that
+/// starts as a pinch stays a pinch.
 #[derive(Debug)]
 pub struct PinchDetector {
     gesture: Gesture,
-    /// Spread and midpoint when the second finger came down.
-    start: Option<(f32, [f32; 2])>,
+    /// Reports seen since two fingers were first down.
+    reports: u32,
+    /// Where the two fingers were once they had settled.
+    start: Option<[[f32; 2]; 2]>,
     /// Spread at the last frame, while pinching.
     last_spread: f32,
 }
@@ -89,28 +107,42 @@ impl Default for PinchDetector {
     fn default() -> Self {
         Self {
             gesture: Gesture::Undecided,
+            reports: 0,
             start: None,
             last_spread: 0.0,
         }
     }
 }
 
+fn sub(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [a[0] - b[0], a[1] - b[1]]
+}
+fn dot(a: [f32; 2], b: [f32; 2]) -> f32 {
+    a[0] * b[0] + a[1] * b[1]
+}
+fn len(a: [f32; 2]) -> f32 {
+    dot(a, a).sqrt()
+}
+
 impl PinchDetector {
     /// Takes where the fingers are now and returns how much to zoom by,
     /// if this frame is part of a pinch. Above 1 is fingers spreading.
     pub fn frame(&mut self, fingers: &[[f32; 2]]) -> Option<f32> {
-        let [a, b] = fingers else {
+        let &[a, b] = fingers else {
             // Not two fingers: whatever was going on is over.
             *self = Self::default();
             return None;
         };
-        let spread = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
-        let middle = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let spread = len(sub(a, b));
         if spread < 1.0 {
             return None;
         }
-        let Some((start_spread, start_middle)) = self.start else {
-            self.start = Some((spread, middle));
+        self.reports += 1;
+        if self.reports <= SETTLE_REPORTS {
+            return None;
+        }
+        let Some([start_a, start_b]) = self.start else {
+            self.start = Some([a, b]);
             return None;
         };
 
@@ -122,22 +154,43 @@ impl PinchDetector {
                 (factor.is_finite() && factor > 0.0).then_some(factor)
             }
             Gesture::Undecided => {
+                let start_spread = len(sub(start_a, start_b));
                 let spread_change = (spread - start_spread).abs();
-                let travel = ((middle[0] - start_middle[0]).powi(2)
-                    + (middle[1] - start_middle[1]).powi(2))
-                .sqrt();
-                if spread_change > PINCH_START * start_spread && spread_change > DOMINANCE * travel
+                // How far each finger has gone, and how far the point
+                // midway between them has.
+                let (moved_a, moved_b) = (sub(a, start_a), sub(b, start_b));
+                let travel = len([
+                    (moved_a[0] + moved_b[0]) / 2.0,
+                    (moved_a[1] + moved_b[1]) / 2.0,
+                ]);
+                // Both fingers going the same way is the signature of a
+                // scroll, and the one thing a pinch never does. It is
+                // checked on its own because spread and midpoint alone
+                // cannot tell the two apart at the start: a scroll
+                // rarely begins with both fingers at once, and with
+                // one stacked above the other the one that leads opens
+                // the spread exactly as the first moment of a pinch
+                // does. What gives it away is the second finger
+                // following.
+                let (far_a, far_b) = (len(moved_a), len(moved_b));
+                let together = far_a.min(far_b) > 0.2 * far_a.max(far_b)
+                    && dot(moved_a, moved_b) > 0.25 * far_a * far_b;
+
+                if travel > SCROLL_FOR_CERTAIN * start_spread
+                    || (together && travel > SCROLL_START * start_spread)
+                {
+                    self.gesture = Gesture::Scrolling;
+                    None
+                } else if !together
+                    && spread_change > PINCH_START * start_spread
+                    && spread_change > DOMINANCE * travel
                 {
                     self.gesture = Gesture::Pinching;
                     self.last_spread = spread;
                     // The movement that proved it a pinch is part of
-                    // the pinch; dropping it would make every one start
-                    // with a small dead zone.
+                    // the pinch; dropping it would give every one a
+                    // dead zone at the start.
                     Some(spread / start_spread)
-                } else if travel > SCROLL_START * start_spread && travel > DOMINANCE * spread_change
-                {
-                    self.gesture = Gesture::Scrolling;
-                    None
                 } else {
                     None
                 }
@@ -281,9 +334,108 @@ mod tests {
 
     const MID: [f32; 2] = [600.0, 400.0];
 
+    /// Two fingers held still for long enough to have settled, at the
+    /// given positions.
+    fn settled(d: &mut PinchDetector, fingers: [[f32; 2]; 2]) {
+        for _ in 0..=SETTLE_REPORTS {
+            assert_eq!(d.frame(&fingers), None);
+        }
+    }
+
+    /// The reported fault. Two fingers one above the other, scrolling
+    /// down, and the lower one sets off a moment before the upper: for
+    /// those first reports the fingers really are moving apart, by
+    /// exactly as much as in the opening of a pinch.
+    #[test]
+    fn a_scroll_led_by_one_finger_is_not_a_pinch() {
+        let mut d = PinchDetector::default();
+        let (top, bottom) = ([600.0, 300.0], [610.0, 600.0]);
+        settled(&mut d, [top, bottom]);
+        let mut product = 1.0;
+        // The lower finger alone, 4 units a report, for 12% of the
+        // spread...
+        for i in 1..=9 {
+            let f = [top, [bottom[0], bottom[1] + 4.0 * i as f32]];
+            product *= d.frame(&f).unwrap_or(1.0);
+        }
+        // ...then the upper one follows and both carry on.
+        for i in 1..=60 {
+            let f = [
+                [top[0], top[1] + 4.0 * i as f32],
+                [bottom[0], bottom[1] + 36.0 + 4.0 * i as f32],
+            ];
+            product *= d.frame(&f).unwrap_or(1.0);
+        }
+        assert_eq!(product, 1.0);
+        assert_eq!(d.gesture, Gesture::Scrolling);
+    }
+
+    /// The same shape the other way up, and sideways, for good measure.
+    #[test]
+    fn no_direction_of_scroll_with_uneven_fingers_zooms() {
+        for (dx, dy) in [(0.0, 5.0), (0.0, -5.0), (5.0, 0.0), (-5.0, 0.0), (4.0, 4.0)] {
+            for (a, b) in [
+                ([600.0, 300.0], [610.0, 600.0]),
+                ([400.0, 400.0], [700.0, 410.0]),
+                ([450.0, 300.0], [650.0, 520.0]),
+            ] {
+                let mut d = PinchDetector::default();
+                settled(&mut d, [a, b]);
+                let mut product = 1.0;
+                for i in 1..=80 {
+                    // One finger covers ground a third faster than the
+                    // other throughout.
+                    let (fast, slow) = (i as f32 * 1.3, i as f32);
+                    let f = [
+                        [a[0] + dx * slow, a[1] + dy * slow],
+                        [b[0] + dx * fast, b[1] + dy * fast],
+                    ];
+                    product *= d.frame(&f).unwrap_or(1.0);
+                }
+                assert_eq!(product, 1.0, "moving {dx},{dy} from {a:?} {b:?}");
+            }
+        }
+    }
+
+    /// The pinch that most resembles a scroll's first moment: the thumb
+    /// planted, one finger moving away from it.
+    #[test]
+    fn a_pinch_with_the_thumb_held_still_is_still_a_pinch() {
+        let mut d = PinchDetector::default();
+        let (thumb, finger) = ([500.0, 600.0], [700.0, 350.0]);
+        settled(&mut d, [thumb, finger]);
+        let start = len(sub(thumb, finger));
+        let mut product = 1.0;
+        let mut last = finger;
+        for i in 1..=40 {
+            last = [finger[0] + 4.0 * i as f32, finger[1] - 5.0 * i as f32];
+            product *= d.frame(&[thumb, last]).unwrap_or(1.0);
+        }
+        assert_eq!(d.gesture, Gesture::Pinching);
+        assert!((product - len(sub(thumb, last)) / start).abs() < 1e-3);
+        assert!(product > 1.5);
+    }
+
+    /// A finger rolling onto the pad slides as it lands. That is not
+    /// the start of anything.
+    #[test]
+    fn a_finger_settling_as_it_lands_is_not_the_start_of_a_pinch() {
+        let mut d = PinchDetector::default();
+        // The second finger arrives 25% further out than where it comes
+        // to rest, and slides in over its first three reports.
+        for slide in [75.0, 50.0, 25.0] {
+            assert_eq!(d.frame(&two(300.0 + slide, MID)), None);
+        }
+        for _ in 0..30 {
+            assert_eq!(d.frame(&two(300.0, MID)), None);
+        }
+        assert_eq!(d.gesture, Gesture::Undecided);
+    }
+
     #[test]
     fn spreading_the_fingers_zooms_in_by_how_far_they_spread() {
         let mut d = PinchDetector::default();
+        settled(&mut d, two(300.0, MID));
         let frames: Vec<_> = (0..=20)
             .map(|i| two(300.0 + 15.0 * i as f32, MID))
             .collect();
@@ -296,6 +448,7 @@ mod tests {
     #[test]
     fn bringing_them_together_zooms_out() {
         let mut d = PinchDetector::default();
+        settled(&mut d, two(600.0, MID));
         let frames: Vec<_> = (0..=20)
             .map(|i| two(600.0 - 15.0 * i as f32, MID))
             .collect();
@@ -328,6 +481,7 @@ mod tests {
     #[test]
     fn a_pinch_stays_a_pinch_when_the_hand_drifts() {
         let mut d = PinchDetector::default();
+        settled(&mut d, two(300.0, MID));
         let frames: Vec<_> = (0..=20)
             .map(|i| two(300.0 + 15.0 * i as f32, [MID[0] + 3.0 * i as f32, MID[1]]))
             .collect();
@@ -370,6 +524,7 @@ mod tests {
             .collect();
         assert_eq!(total(&mut d, &scroll), 1.0);
         assert_eq!(d.frame(&[]), None);
+        settled(&mut d, two(300.0, MID));
         let pinch: Vec<_> = (0..=20)
             .map(|i| two(300.0 + 15.0 * i as f32, MID))
             .collect();
@@ -381,6 +536,7 @@ mod tests {
     #[test]
     fn a_second_pinch_does_not_inherit_the_first_one_s_spread() {
         let mut d = PinchDetector::default();
+        settled(&mut d, two(300.0, MID));
         let first: Vec<_> = (0..=20)
             .map(|i| two(300.0 + 15.0 * i as f32, MID))
             .collect();
