@@ -256,6 +256,62 @@ fn keys_still_work_after_clicking_something_on_the_bar() {
     });
 }
 
+/// Ctrl + scroll is how a zoom is done, and a platform can go on
+/// reporting Ctrl as held afterwards. F and W are what is wanted next.
+#[test]
+fn f_and_w_work_with_ctrl_reported_as_held() {
+    both_modes(|mut r| {
+        for (key, fit) in [(Key::W, Fit::Width), (Key::F, Fit::Page)] {
+            r.frame_with(
+                vec![Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::CTRL,
+                }],
+                Modifiers::CTRL,
+            );
+            r.frame(vec![]);
+            assert_eq!(r.app.fit, Some(fit));
+        }
+    });
+}
+
+/// The letter arriving only as typed text, with no key press.
+#[test]
+fn f_and_w_work_when_only_the_typed_letter_arrives() {
+    both_modes(|mut r| {
+        r.frame(vec![Event::Text("w".to_owned())]);
+        r.frame(vec![]);
+        assert_eq!(r.app.fit, Some(Fit::Width));
+        r.frame(vec![Event::Text("F".to_owned())]);
+        r.frame(vec![]);
+        assert_eq!(r.app.fit, Some(Fit::Page));
+    });
+}
+
+/// Alt+F is the Files menu and nothing else.
+#[test]
+fn alt_f_opens_the_files_menu_and_does_not_refit() {
+    both_modes(|mut r| {
+        r.press(Key::W);
+        r.frame_with(
+            vec![Event::Key {
+                key: Key::F,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::ALT,
+            }],
+            Modifiers::ALT,
+        );
+        r.frame(vec![]);
+        assert_eq!(r.app.fit, Some(Fit::Width));
+        assert!(r.app.open_menu.is_some());
+    });
+}
+
 /// The capsule that names the zoom stays one line when what it says
 /// gets longer.
 ///

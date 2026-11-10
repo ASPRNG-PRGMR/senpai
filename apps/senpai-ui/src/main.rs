@@ -1278,11 +1278,17 @@ impl SenpaiApp {
                 }
                 self.rebinding = None;
             }
-        } else if !ctx.wants_keyboard_input() {
+        } else if !self.page_editing {
             // Skipped entirely while the page box has the keyboard. The
             // keys it needs are the ones this block would act on: a
             // digit could be someone's bound direction, the arrows move
             // its cursor, and `-` and `+` would zoom mid-number.
+            //
+            // The page box specifically, and not "anything in egui has
+            // focus", which is what this used to ask. That is true of
+            // any widget egui has handed focus to, and the price of
+            // being wrong about one is every key in the reader going
+            // dead with nothing on screen to say why.
             let keys = self.nav_keys;
             let (nav, want_zoom_in, want_zoom_out, want_zoom_reset) = ctx.input(|i| {
                 // A direction fires on its built-in keys or on whatever
@@ -1311,18 +1317,31 @@ impl SenpaiApp {
                     i.modifiers.command && i.key_pressed(egui::Key::Num0),
                 )
             });
-            // F and W, as in Evince. Bare keys only -- Alt+F is the
-            // Files menu -- and only while the reader has not made the
+            // F and W, as in Evince. Not with Alt, which makes F the
+            // Files menu, and only while the reader has not made the
             // key a direction: the Gamer preset has W as Up, and a
             // binding someone set on purpose outranks a default.
+            //
+            // Otherwise taken generously, on purpose. Ctrl is not
+            // checked: nothing else here uses Ctrl+F or Ctrl+W, and a
+            // Ctrl the platform believes is still held after a
+            // Ctrl + scroll zoom would otherwise switch both keys off
+            // at exactly the moment they are wanted. And the letter
+            // counts whether it arrives as a key press or as typed
+            // text, since those take different routes through the
+            // platform and either can be the one that goes missing.
             let (want_fit_page, want_fit_width) = ctx.input(|i| {
-                let bare = !i.modifiers.alt && !i.modifiers.command;
                 let free =
                     |key: egui::Key| NavTarget::ALL.iter().all(|t| keys.get(*t) != Some(key));
-                (
-                    bare && free(egui::Key::F) && i.key_pressed(egui::Key::F),
-                    bare && free(egui::Key::W) && i.key_pressed(egui::Key::W),
-                )
+                let typed = |letter: &str| {
+                    i.events.iter().any(
+                        |e| matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case(letter)),
+                    )
+                };
+                let asked = |key: egui::Key, letter: &str| {
+                    !i.modifiers.alt && free(key) && (i.key_pressed(key) || typed(letter))
+                };
+                (asked(egui::Key::F, "f"), asked(egui::Key::W, "w"))
             });
             if want_fit_page {
                 self.set_fit(Fit::Page);
