@@ -187,6 +187,58 @@ fn zoom_note(fit: Option<Fit>, scale: f64) -> String {
     }
 }
 
+/// Appends this frame's keyboard, wheel and gesture input to the file
+/// named by `SENPAI_TRACE`, if that is set. Does nothing otherwise.
+///
+/// A file rather than stderr because the Windows build is a GUI program
+/// and has no stderr to write to. It exists because input is the one
+/// thing about this reader that cannot be reproduced from a description:
+/// what a given keyboard, touchpad and platform actually deliver has to
+/// be looked at. "W does nothing" is one line of this away from being
+/// either "no W ever arrived" or "W arrived with Ctrl held".
+fn trace_input(ctx: &egui::Context) {
+    let Some(path) = env::var_os("SENPAI_TRACE") else {
+        return;
+    };
+    let mut out = String::new();
+    ctx.input(|i| {
+        for event in &i.events {
+            match event {
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    modifiers,
+                    ..
+                } => out.push_str(&format!(
+                    "key {key:?} physical={physical_key:?} pressed={pressed} modifiers={modifiers:?}\n"
+                )),
+                egui::Event::Text(text) => out.push_str(&format!("text {text:?}\n")),
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } => out.push_str(&format!(
+                    "wheel {unit:?} {delta:?} modifiers={modifiers:?}\n"
+                )),
+                egui::Event::Zoom(factor) => out.push_str(&format!("zoom {factor}\n")),
+                _ => {}
+            }
+        }
+    });
+    if out.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(out.as_bytes());
+    }
+}
+
 /// Largest text file either text view will open. See `read_text`.
 const MAX_TEXT_BYTES: usize = 512 * 1024;
 
@@ -1231,6 +1283,7 @@ impl SenpaiApp {
     /// showing, then the chrome over it.
     fn frame(&mut self, ctx: &egui::Context) {
         self.pending_evictions.clear();
+        trace_input(ctx);
 
         // Click anywhere off the chrome to dismiss an open menu. Checked
         // before the bar is drawn, against last frame's geometry, so a
