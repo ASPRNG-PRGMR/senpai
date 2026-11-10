@@ -54,7 +54,7 @@ use senpai_core::engine::{PdfEngine, PdfEngineOpen};
 use senpai_core::file_loader::LoadedFile;
 use senpai_core::model::{PageHandle, PageSize, RenderedPage};
 use senpai_pdf_poppler::PopplerEngine;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -494,6 +494,12 @@ struct SenpaiApp {
 
     textures: LruCache<(usize, u64), egui::TextureHandle>,
     pending_evictions: Vec<egui::TextureHandle>,
+    /// Pages (at a scale) the engine could not render. Remembered so
+    /// they are not asked for again: every view asks for what it has no
+    /// texture for, a failed page never gets one, and without this the
+    /// worker would be handed the same doomed page on every frame for
+    /// as long as it was on screen.
+    failed: HashSet<(usize, u64)>,
     render_pending: bool,
     continuous_render_pending: bool,
 
@@ -626,6 +632,7 @@ impl SenpaiApp {
             requested_primary: None,
             textures: LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()),
             pending_evictions: Vec::new(),
+            failed: HashSet::new(),
             render_pending: false,
             continuous_render_pending: false,
             dark_mode: true,
@@ -889,6 +896,7 @@ impl SenpaiApp {
         // Dropping the receiver makes any result the old worker still
         // sends a no-op, so a late render can't land on the new document.
         self.result_rx = None;
+        self.failed.clear();
 
         // The old document's textures go through pending_evictions rather
         // than being dropped here: this runs mid-update(), and dropping a
@@ -927,7 +935,7 @@ impl SenpaiApp {
             return;
         };
         let want = (page, self.scale.to_bits());
-        let already_current = self.textures.contains(&want);
+        let already_current = self.textures.contains(&want) || self.failed.contains(&want);
         let already_requested = self
             .requested_primary
             .map(|(p, s, _)| (p, s) == want)
@@ -963,7 +971,7 @@ impl SenpaiApp {
             return;
         }
         let key = (page, self.scale.to_bits());
-        if self.textures.contains(&key) {
+        if self.textures.contains(&key) || self.failed.contains(&key) {
             return;
         }
         let (lock, cvar) = &*shared;
@@ -990,7 +998,10 @@ impl SenpaiApp {
         let scale_bits = scale.to_bits();
         let wanted: VecDeque<(usize, f64)> = pages
             .iter()
-            .filter(|&&page| !self.textures.contains(&(page, scale_bits)))
+            .filter(|&&page| {
+                let key = (page, scale_bits);
+                !self.textures.contains(&key) && !self.failed.contains(&key)
+            })
             .map(|&page| (page, scale))
             .collect();
         let (lock, cvar) = &**shared;
@@ -1076,6 +1087,7 @@ impl SenpaiApp {
                 }
                 Err(e) => {
                     eprintln!("render failed for page {}: {e}", result.page);
+                    self.failed.insert(key);
                 }
             }
         }
@@ -1637,7 +1649,10 @@ impl SenpaiApp {
                             );
                             return;
                         }
-                        any_missing = true;
+                        let failed = self.failed.contains(&(page, scale_bits));
+                        // A page that cannot be rendered is not one
+                        // still being waited for.
+                        any_missing |= !failed;
                         // The same page at another zoom, if there is
                         // one, stretched into place. Right after a zoom
                         // that is every page on screen: soft for a
@@ -1670,7 +1685,11 @@ impl SenpaiApp {
                         painter.text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
-                            format!("{}", page + 1),
+                            if failed {
+                                format!("Page {} could not be rendered", page + 1)
+                            } else {
+                                format!("{}", page + 1)
+                            },
                             egui::FontId::proportional(13.0),
                             egui::Color32::from_gray(if dark { 110 } else { 150 }),
                         );
