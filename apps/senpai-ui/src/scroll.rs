@@ -61,6 +61,19 @@ impl WheelStep {
         }
     }
 
+    /// The name it is saved under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fine => "fine",
+            Self::Normal => "normal",
+            Self::Fast => "fast",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name() == name)
+    }
+
     /// The step, in points.
     pub fn points(self) -> f32 {
         match self {
@@ -396,6 +409,10 @@ mod tests {
     #[test]
     fn the_wheel_step_starts_fine_and_each_is_bigger_than_the_last() {
         assert_eq!(WheelStep::default(), WheelStep::Fine);
+        for step in WheelStep::ALL {
+            assert_eq!(WheelStep::from_name(step.name()), Some(step));
+        }
+        assert_eq!(WheelStep::from_name("warp"), None);
         assert!(WheelStep::Fine.points() < WheelStep::Normal.points());
         assert!(WheelStep::Normal.points() < WheelStep::Fast.points());
     }

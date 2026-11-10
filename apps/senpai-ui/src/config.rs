@@ -1,8 +1,8 @@
 //! Where the reader keeps the handful of things it remembers between
 //! runs.
 //!
-//! Two of them now -- the recent-documents list and the navigation keys
-//! -- which is why this is its own module rather than a private helper
+//! Three of them now -- the recent-documents list, the navigation keys
+//! and the view settings -- which is why this is its own module rather than a private helper
 //! inside whichever one came first.
 //!
 //! Everything stored is plain text in a file per setting, deliberately

@@ -37,8 +37,9 @@
 //!
 //! Continuous scroll lives in `continuous.rs`: the layout arithmetic and
 //! the scroll area around it. This file feeds it textures and turns
-//! what it reports as visible into render requests. Paged is still the
-//! mode a document opens in.
+//! what it reports as visible into render requests. Paged is the same
+//! view over one page. Which of the two a document opens in is whichever
+//! was used last (`settings.rs`).
 
 mod config;
 mod continuous;
@@ -46,6 +47,7 @@ mod keybinds;
 mod markdown;
 mod recent;
 mod scroll;
+mod settings;
 mod theme;
 
 use continuous::Fit;
@@ -689,6 +691,7 @@ fn load_document(path: &Path) -> Result<(PopplerEngine, Vec<PageSize>), String> 
 
 impl SenpaiApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        let saved = settings::Settings::load();
         let mut app = Self {
             page_count: 0,
             doc_path: None,
@@ -711,10 +714,14 @@ impl SenpaiApp {
             zoom_focus: None,
             settle_until: 0.0,
             last_avail: egui::Vec2::ZERO,
-            wheel_step: WheelStep::default(),
+            wheel_step: saved.wheel_step,
             dark_mode: true,
             auto_hide_enabled: true,
-            view_mode: ViewMode::Paged,
+            view_mode: if saved.continuous {
+                ViewMode::Continuous
+            } else {
+                ViewMode::Paged
+            },
             nav_keys: NavKeys::load(),
             rebinding: None,
             rebind_rejected: None,
@@ -1150,9 +1157,20 @@ impl SenpaiApp {
         }
     }
 
+    /// Remembers the choices that should outlast this run. Called at
+    /// the point each one is changed.
+    fn save_settings(&self) {
+        settings::Settings {
+            continuous: self.view_mode == ViewMode::Continuous,
+            wheel_step: self.wheel_step,
+        }
+        .save();
+    }
+
     fn set_view_mode(&mut self, mode: ViewMode) {
         if self.view_mode != mode {
             self.view_mode = mode;
+            self.save_settings();
             if mode == ViewMode::Continuous {
                 // Arrive on the page that was being read. The other
                 // direction needs nothing: the continuous view keeps
@@ -2249,6 +2267,7 @@ impl SenpaiApp {
             .unwrap_or(0);
         if let Some(i) = theme::segmented(ui, "wheel_seg", &labels, current) {
             self.wheel_step = WheelStep::ALL[i];
+            self.save_settings();
         }
         ui.label(
             egui::RichText::new(
